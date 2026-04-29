@@ -29,6 +29,7 @@ if _PYFLYDSL_SRC not in sys.path:
 
 from kernels.preshuffle_gemm import compile_preshuffle_gemm_a8
 from kernels.preshuffle_gemm import compile_preshuffle_gemm_w4
+from kernels.preshuffle_gemm_fp8_8wave import compile_preshuffle_gemm_fp8_8wave
 from tests.test_common import run_perftest, verify_output
 from tests.utils import pertoken_quant, shuffle_weight
 from tests.kernels.utils import fp4_utils
@@ -100,6 +101,8 @@ def test_mfma_a8_flyc_preshuffle(
     waves_per_eu: int = 0,
     dsrd_preload: int = 2,
     dvmem_preload: int = 2,
+    use_8wave_kernel: bool = False,
+    skip_verify: bool = False,
 ):
     """Preshuffle GEMM using the @flyc.kernel / @flyc.jit API."""
     if use_async_copy and get_rocm_arch() not in ("gfx942", "gfx950"):
@@ -117,20 +120,37 @@ def test_mfma_a8_flyc_preshuffle(
 
     _wpe = int(waves_per_eu) if waves_per_eu else 0
     _wpe = None if _wpe <= 0 else _wpe
-    launch_fn = compile_preshuffle_gemm_a8(
-        M=M, N=N, K=K,
-        tile_m=tile_m, tile_n=tile_n, tile_k=tile_k,
-        in_dtype=in_dtype,
-        out_dtype=out_dtype,
-        lds_stage=lds_stage,
-        use_cshuffle_epilog=bool(use_cshuffle_epilog),
-        use_async_copy=bool(use_async_copy),
-        dsrd_preload=int(dsrd_preload),
-        dvmem_preload=int(dvmem_preload),
-        waves_per_eu=_wpe,
-    )
+    if bool(use_8wave_kernel):
+        if in_dtype != "fp8":
+            raise ValueError("--use_8wave_kernel currently supports only --in_dtype fp8")
+        launch_fn = compile_preshuffle_gemm_fp8_8wave(
+            M=M, N=N, K=K,
+            tile_m=tile_m, tile_n=tile_n, tile_k=tile_k,
+            out_dtype=out_dtype,
+            lds_stage=lds_stage,
+            use_cshuffle_epilog=bool(use_cshuffle_epilog),
+            use_async_copy=bool(use_async_copy),
+            dsrd_preload=int(dsrd_preload),
+            dvmem_preload=int(dvmem_preload),
+            waves_per_eu=_wpe,
+        )
+        kernel_name = "8-wave"
+    else:
+        launch_fn = compile_preshuffle_gemm_a8(
+            M=M, N=N, K=K,
+            tile_m=tile_m, tile_n=tile_n, tile_k=tile_k,
+            in_dtype=in_dtype,
+            out_dtype=out_dtype,
+            lds_stage=lds_stage,
+            use_cshuffle_epilog=bool(use_cshuffle_epilog),
+            use_async_copy=bool(use_async_copy),
+            dsrd_preload=int(dsrd_preload),
+            dvmem_preload=int(dvmem_preload),
+            waves_per_eu=_wpe,
+        )
+        kernel_name = "default"
     print(
-        f"✓ Kernel prepared (lds_stage={lds_stage}, async_copy={use_async_copy}, "
+        f"✓ Kernel prepared (kernel={kernel_name}, lds_stage={lds_stage}, async_copy={use_async_copy}, "
         f"waves_per_eu={_wpe}, dsrd_preload={dsrd_preload}, dvmem_preload={dvmem_preload})"
     )
 
@@ -186,7 +206,9 @@ def test_mfma_a8_flyc_preshuffle(
     if is_int4:
         b_packed = _pack_shuffled_int8_to_packed_int4_no_perm(b_shuffled)
 
-    c_ref = run_torch(a_q, b_q, scale_a, scale_b, bias=None, dtype=torch.float32)
+    c_ref = None
+    if not bool(skip_verify):
+        c_ref = run_torch(a_q, b_q, scale_a, scale_b, bias=None, dtype=torch.float32)
     c_out_raw = torch.zeros((M, N), dtype=torch_out_dtype, device=device)
 
     b_input = b_packed if is_int4 else b_shuffled
@@ -233,11 +255,16 @@ def test_mfma_a8_flyc_preshuffle(
         testGraph=test_graph,
     )
     torch.cuda.synchronize()
-    c_out_scaled = c_out_raw.to(torch.float32)
+    if bool(skip_verify):
+        print("Skipping correctness verification (--skip_verify).")
+    else:
+        c_out_scaled = c_out_raw.to(torch.float32)
+        assert verify_output(c_out_scaled, c_ref, rtol=0.1, atol=0.1)
 
-    assert verify_output(c_out_scaled, c_ref, rtol=0.1, atol=0.1)
-
-    if HAS_AITER and bool(run_aiter_bench) and (not is_int4) and (in_dtype in ("fp8", "int8")):
+    if (
+        HAS_AITER and bool(run_aiter_bench) and (not is_int4)
+        and (in_dtype in ("fp8", "int8")) and c_ref is not None
+    ):
         print("-" * 40)
         print("Running Aiter Benchmark...")
         try:
@@ -425,6 +452,10 @@ if __name__ == "__main__":
     parser.add_argument("--flyc", action="store_true", default=True)
     parser.add_argument("--use_async_copy", action="store_true", default=False)
     parser.add_argument("--use_cshuffle_epilog", action="store_true", default=False)
+    parser.add_argument("--use_8wave_kernel", action="store_true", default=False,
+                        help="Run the compact 8-wave row-wise FP8 kernel.")
+    parser.add_argument("--skip_verify", action="store_true", default=False,
+                        help="Skip torch reference and correctness check for benchmark-only runs.")
     parser.add_argument("--waves_per_eu", type=int, default=0, choices=[0, 1, 2, 3, 4])
     parser.add_argument("--run_aiter_bench", action="store_true", default=DEFAULT_RUN_AITER_BENCH)
     parser.add_argument("--no_aiter_bench", action="store_false", dest="run_aiter_bench")
@@ -437,6 +468,8 @@ if __name__ == "__main__":
         if not args.wfp4:
             if args.in_dtype == "fp4":
                 raise ValueError("--in_dtype fp4 requires --wfp4")
+            if args.use_8wave_kernel and args.in_dtype != "fp8":
+                raise ValueError("--use_8wave_kernel only supports --in_dtype fp8")
             test_mfma_a8_flyc_preshuffle(
                 args.in_dtype,
                 M=args.M, N=args.N, K=args.K,
@@ -452,6 +485,8 @@ if __name__ == "__main__":
                 run_aiter_bench=bool(args.run_aiter_bench),
                 use_cshuffle_epilog=bool(args.use_cshuffle_epilog),
                 waves_per_eu=int(args.waves_per_eu),
+                use_8wave_kernel=bool(args.use_8wave_kernel),
+                skip_verify=bool(args.skip_verify),
             )
         else:
             test_mfma_w4_flyc_preshuffle(
