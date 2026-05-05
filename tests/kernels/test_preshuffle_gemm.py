@@ -29,7 +29,13 @@ if _PYFLYDSL_SRC not in sys.path:
 
 from kernels.preshuffle_gemm import compile_preshuffle_gemm_a8
 from kernels.preshuffle_gemm import compile_preshuffle_gemm_w4
-from kernels.preshuffle_gemm_fp8_8wave import compile_preshuffle_gemm_fp8_8wave
+from kernels.preshuffle_gemm_fp8_8wave import (
+    compile_preshuffle_gemm_fp8_8wave,
+    compile_preshuffle_gemm_fp8_8wave_aonly_pingpong,
+)
+from kernels.preshuffle_gemm_fp8_8wave_hip_pingpong import (
+    compile_preshuffle_gemm_fp8_8wave_hip_pingpong,
+)
 from tests.test_common import run_perftest, verify_output
 from tests.utils import pertoken_quant, shuffle_weight
 from tests.kernels.utils import fp4_utils
@@ -102,6 +108,8 @@ def test_mfma_a8_flyc_preshuffle(
     dsrd_preload: int = 2,
     dvmem_preload: int = 2,
     use_8wave_kernel: bool = False,
+    use_8wave_aonly_pingpong: bool = False,
+    use_8wave_hip_pingpong: bool = False,
     skip_verify: bool = False,
 ):
     """Preshuffle GEMM using the @flyc.kernel / @flyc.jit API."""
@@ -120,21 +128,54 @@ def test_mfma_a8_flyc_preshuffle(
 
     _wpe = int(waves_per_eu) if waves_per_eu else 0
     _wpe = None if _wpe <= 0 else _wpe
-    if bool(use_8wave_kernel):
+    num_8wave_modes = sum(
+        int(bool(v))
+        for v in (use_8wave_kernel, use_8wave_aonly_pingpong, use_8wave_hip_pingpong)
+    )
+    if num_8wave_modes > 1:
+        raise ValueError("8-wave kernel modes are mutually exclusive")
+    if bool(use_8wave_kernel) or bool(use_8wave_aonly_pingpong) or bool(use_8wave_hip_pingpong):
         if in_dtype != "fp8":
-            raise ValueError("--use_8wave_kernel currently supports only --in_dtype fp8")
-        launch_fn = compile_preshuffle_gemm_fp8_8wave(
-            M=M, N=N, K=K,
-            tile_m=tile_m, tile_n=tile_n, tile_k=tile_k,
-            out_dtype=out_dtype,
-            lds_stage=lds_stage,
-            use_cshuffle_epilog=bool(use_cshuffle_epilog),
-            use_async_copy=bool(use_async_copy),
-            dsrd_preload=int(dsrd_preload),
-            dvmem_preload=int(dvmem_preload),
-            waves_per_eu=_wpe,
-        )
-        kernel_name = "8-wave"
+            raise ValueError("8-wave kernels currently support only --in_dtype fp8")
+        if bool(use_8wave_hip_pingpong):
+            launch_fn = compile_preshuffle_gemm_fp8_8wave_hip_pingpong(
+                M=M, N=N, K=K,
+                tile_m=tile_m, tile_n=tile_n, tile_k=tile_k,
+                out_dtype=out_dtype,
+                lds_stage=lds_stage,
+                use_cshuffle_epilog=bool(use_cshuffle_epilog),
+                use_async_copy=bool(use_async_copy),
+                dsrd_preload=int(dsrd_preload),
+                dvmem_preload=int(dvmem_preload),
+                waves_per_eu=_wpe,
+            )
+            kernel_name = "8-wave-hip-pingpong"
+        elif bool(use_8wave_aonly_pingpong):
+            launch_fn = compile_preshuffle_gemm_fp8_8wave_aonly_pingpong(
+                M=M, N=N, K=K,
+                tile_m=tile_m, tile_n=tile_n, tile_k=tile_k,
+                out_dtype=out_dtype,
+                lds_stage=lds_stage,
+                use_cshuffle_epilog=bool(use_cshuffle_epilog),
+                use_async_copy=bool(use_async_copy),
+                dsrd_preload=int(dsrd_preload),
+                dvmem_preload=int(dvmem_preload),
+                waves_per_eu=_wpe,
+            )
+            kernel_name = "8-wave-aonly-pingpong"
+        else:
+            launch_fn = compile_preshuffle_gemm_fp8_8wave(
+                M=M, N=N, K=K,
+                tile_m=tile_m, tile_n=tile_n, tile_k=tile_k,
+                out_dtype=out_dtype,
+                lds_stage=lds_stage,
+                use_cshuffle_epilog=bool(use_cshuffle_epilog),
+                use_async_copy=bool(use_async_copy),
+                dsrd_preload=int(dsrd_preload),
+                dvmem_preload=int(dvmem_preload),
+                waves_per_eu=_wpe,
+            )
+            kernel_name = "8-wave"
     else:
         launch_fn = compile_preshuffle_gemm_a8(
             M=M, N=N, K=K,
@@ -454,6 +495,10 @@ if __name__ == "__main__":
     parser.add_argument("--use_cshuffle_epilog", action="store_true", default=False)
     parser.add_argument("--use_8wave_kernel", action="store_true", default=False,
                         help="Run the compact 8-wave row-wise FP8 kernel.")
+    parser.add_argument("--use_8wave_aonly_pingpong", action="store_true", default=False,
+                        help="Run the experimental A-only wave-specialized 8-wave kernel.")
+    parser.add_argument("--use_8wave_hip_pingpong", action="store_true", default=False,
+                        help="Run the experimental HIP-style 8-wave ping-pong FP8 kernel.")
     parser.add_argument("--skip_verify", action="store_true", default=False,
                         help="Skip torch reference and correctness check for benchmark-only runs.")
     parser.add_argument("--waves_per_eu", type=int, default=0, choices=[0, 1, 2, 3, 4])
@@ -470,6 +515,10 @@ if __name__ == "__main__":
                 raise ValueError("--in_dtype fp4 requires --wfp4")
             if args.use_8wave_kernel and args.in_dtype != "fp8":
                 raise ValueError("--use_8wave_kernel only supports --in_dtype fp8")
+            if args.use_8wave_aonly_pingpong and args.in_dtype != "fp8":
+                raise ValueError("--use_8wave_aonly_pingpong only supports --in_dtype fp8")
+            if args.use_8wave_hip_pingpong and args.in_dtype != "fp8":
+                raise ValueError("--use_8wave_hip_pingpong only supports --in_dtype fp8")
             test_mfma_a8_flyc_preshuffle(
                 args.in_dtype,
                 M=args.M, N=args.N, K=args.K,
@@ -486,6 +535,8 @@ if __name__ == "__main__":
                 use_cshuffle_epilog=bool(args.use_cshuffle_epilog),
                 waves_per_eu=int(args.waves_per_eu),
                 use_8wave_kernel=bool(args.use_8wave_kernel),
+                use_8wave_aonly_pingpong=bool(args.use_8wave_aonly_pingpong),
+                use_8wave_hip_pingpong=bool(args.use_8wave_hip_pingpong),
                 skip_verify=bool(args.skip_verify),
             )
         else:

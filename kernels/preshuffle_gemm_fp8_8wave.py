@@ -18,7 +18,7 @@ from typing import Optional
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import buffer_ops, const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr import arith, buffer_ops, const_expr, gpu, range_constexpr, rocdl
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 from kernels.mfma_preshuffle_pipeline import (
@@ -62,6 +62,7 @@ def compile_preshuffle_gemm_fp8_8wave(
     use_async_copy: bool = True,
     dsrd_preload: int = -1,
     dvmem_preload: int = -1,
+    aonly_wave_pingpong: bool = False,
 ):
     """Compile an 8-wave FP8 preshuffle GEMM with row-wise fp32 scales.
 
@@ -131,6 +132,13 @@ def compile_preshuffle_gemm_fp8_8wave(
     num_b_loads = bytes_per_thread_b // b_load_bytes
     num_a_lds_load = bytes_a_per_tile // _WAVE_SIZE // a_load_bytes
     num_a_async_loads = bytes_per_thread_a // a_async_load_bytes
+    half_threads = _TOTAL_THREADS // 2
+    bytes_per_thread_a_half = bytes_a_per_tile // half_threads
+    if bytes_per_thread_a_half % a_async_load_bytes != 0:
+        raise ValueError(
+            f"bytes_per_thread_a_half ({bytes_per_thread_a_half}) must be divisible by 16"
+        )
+    num_a_async_loads_half = bytes_per_thread_a_half // a_async_load_bytes
 
     allocator_pong = SmemAllocator(None, arch=gpu_arch, global_sym_name="smem0")
     allocator_ping = SmemAllocator(None, arch=gpu_arch, global_sym_name="smem1")
@@ -170,7 +178,9 @@ def compile_preshuffle_gemm_fp8_8wave(
         i32_m: fx.Int32,
         i32_n: fx.Int32,
     ):
-        from flydsl._mlir.dialects import memref as memref_dialect
+        from flydsl._mlir import ir
+        from flydsl._mlir.dialects import llvm, memref as memref_dialect, scf
+        from flydsl._mlir.dialects.arith import CmpIPredicate
 
         c_m = fx.Index(i32_m)
         c_n = fx.Index(i32_n)
@@ -298,6 +308,8 @@ def compile_preshuffle_gemm_fp8_8wave(
         c4 = fx.Index(4)
         tx_i32_base = tx * c4
         tx_i32_async_base = tx * a_async_load_dword
+        tx_in_half = tx % fx.Index(half_threads)
+        tx_i32_async_half_base = tx_in_half * a_async_load_dword
 
         def a_tile_chunk_coord_i32(i: int):
             return tile_chunk_coord_i32(
@@ -338,6 +350,16 @@ def compile_preshuffle_gemm_fp8_8wave(
                 chunk_i32=a_async_load_dword,
             )
 
+        def a_tile_chunk_coord_i32_async_half(i: int):
+            return tile_chunk_coord_i32(
+                fx.arith,
+                tx_i32_base=tx_i32_async_half_base,
+                i=i,
+                total_threads=half_threads,
+                layout_tile_div4=layout_a_tile_div4,
+                chunk_i32=a_async_load_dword,
+            )
+
         def dma_a_tile_to_lds(base_k_div4, lds_buffer):
             wave_offset = rocdl.readfirstlane(
                 fx.Int64.ir_type,
@@ -367,8 +389,45 @@ def compile_preshuffle_gemm_fp8_8wave(
                     fx.Int32(1),
                 )
 
+        def dma_a_tile_to_lds_half(base_k_div4, lds_buffer):
+            half_wave_id = wave_id % fx.Index(4)
+            wave_offset = rocdl.readfirstlane(
+                fx.Int64.ir_type,
+                fx.Int64(half_wave_id * fx.Index(_WAVE_SIZE * a_async_load_bytes)),
+            )
+            lds_base = memref_dialect.extract_aligned_pointer_as_index(lds_buffer)
+            lds_ptr_base = buffer_ops.create_llvm_ptr(fx.Int64(lds_base), address_space=3)
+            lds_ptr = buffer_ops.get_element_ptr(lds_ptr_base, wave_offset)
+
+            for i in range_constexpr(num_a_async_loads_half):
+                row_a_local, col_a_local_i32 = a_tile_chunk_coord_i32_async_half(i)
+                col_a_swz = swizzle_xor16(row_a_local, col_a_local_i32 * c4, k_blocks16)
+                row_a_global = bx_m + row_a_local
+                global_byte_idx = row_a_global * fx.Index(K) + base_k_div4 * c4 + col_a_swz
+                if const_expr(i > 0):
+                    lds_ptr = buffer_ops.get_element_ptr(
+                        lds_ptr,
+                        static_byte_offset=half_threads * a_async_load_bytes,
+                    )
+                rocdl.raw_ptr_buffer_load_lds(
+                    a_rsrc,
+                    lds_ptr,
+                    fx.Int32(a_async_load_bytes),
+                    fx.Int32(global_byte_idx),
+                    fx.Int32(0),
+                    fx.Int32(0),
+                    fx.Int32(1),
+                )
+
         def prefetch_a_to_lds(base_k, lds_buffer):
             dma_a_tile_to_lds(base_k // fx.Index(4), lds_buffer)
+
+        def prefetch_a_to_lds_half_by_high_waves(base_k, lds_buffer):
+            is_high_wave = arith.cmpi(CmpIPredicate.uge, wave_id, fx.Index(4))
+            if_op = scf.IfOp(is_high_wave, results_=[], has_else=False)
+            with ir.InsertionPoint(if_op.then_block):
+                dma_a_tile_to_lds_half(base_k // fx.Index(4), lds_buffer)
+                scf.YieldOp([])
 
         def prefetch_a_tile(base_k):
             return load_a_tile(base_k // fx.Index(4))
@@ -441,6 +500,26 @@ def compile_preshuffle_gemm_fp8_8wave(
                             ],
                         )
             return accs, scales
+
+        def _raw_value(v):
+            return v.ir_value() if const_expr(hasattr(v, "ir_value")) else v
+
+        def compute_tile_if(accs_in, compute_cond, base_k, lds_buffer, *, a0_prefetch=None):
+            acc_raw = [_raw_value(v) for v in accs_in]
+            if_op = scf.IfOp(
+                compute_cond,
+                [v.type for v in acc_raw],
+                has_else=True,
+            )
+            with ir.InsertionPoint(if_op.then_block):
+                b_tile = load_b_tile(base_k)
+                accs_then, _ = compute_tile(
+                    accs_in, b_tile, lds_buffer, a0_prefetch=a0_prefetch
+                )
+                scf.YieldOp([_raw_value(v) for v in accs_then])
+            with ir.InsertionPoint(if_op.else_block):
+                scf.YieldOp(acc_raw)
+            return [Vec(v) for v in if_op.results]
 
         def store_output(final_accs, scales):
             s_a_vecs, s_b_vals = scales
@@ -538,6 +617,95 @@ def compile_preshuffle_gemm_fp8_8wave(
 
         def prefetch_a0_pack(lds_buffer):
             return lds_load_packs_k64(row_a_lds, col_offset_base_bytes, lds_buffer)
+
+        def _inline_asm(asm_string: str):
+            llvm.InlineAsmOp(
+                res=None,
+                operands_=[],
+                asm_string=asm_string,
+                constraints="",
+                has_side_effects=True,
+                is_align_stack=False,
+            )
+
+        def _asm_waitcnt_vmcnt(vmcnt: int):
+            _inline_asm(f"s_waitcnt vmcnt({int(vmcnt)})")
+
+        def _asm_barrier():
+            _inline_asm("s_barrier")
+
+        def _asm_wait_vmcnt_then_barrier(vmcnt: int):
+            _inline_asm(f"s_waitcnt vmcnt({int(vmcnt)})\ns_barrier")
+
+        def aonly_pair_body(k_iv, inner_state):
+            accs_in = list(inner_state)
+            low_waves = arith.cmpi(CmpIPredicate.ult, wave_id, fx.Index(4))
+            high_waves = arith.cmpi(CmpIPredicate.uge, wave_id, fx.Index(4))
+
+            next_k = k_iv + tile_k
+            prefetch_a_to_lds_half_by_high_waves(next_k, lds_a_ping)
+            accs_mid = compute_tile_if(accs_in, low_waves, k_iv, lds_a_pong)
+            _asm_wait_vmcnt_then_barrier(0)
+            a0_prefetch_pong = prefetch_a0_pack(lds_a_pong)
+            accs_mid = compute_tile_if(
+                accs_mid, high_waves, k_iv, lds_a_pong, a0_prefetch=a0_prefetch_pong
+            )
+            _asm_barrier()
+
+            next2_k = k_iv + (tile_k * 2)
+            prefetch_a_to_lds_half_by_high_waves(next2_k, lds_a_pong)
+            accs_mid = compute_tile_if(accs_mid, low_waves, next_k, lds_a_ping)
+            _asm_wait_vmcnt_then_barrier(0)
+            a0_prefetch_ping = prefetch_a0_pack(lds_a_ping)
+            accs_out = compute_tile_if(
+                accs_mid, high_waves, next_k, lds_a_ping, a0_prefetch=a0_prefetch_ping
+            )
+            _asm_waitcnt_vmcnt(0)
+            _asm_barrier()
+            return accs_out
+
+        def aonly_tail_pair(k_iv, inner_state):
+            accs_in = list(inner_state)
+            low_waves = arith.cmpi(CmpIPredicate.ult, wave_id, fx.Index(4))
+            high_waves = arith.cmpi(CmpIPredicate.uge, wave_id, fx.Index(4))
+
+            next_k = k_iv + tile_k
+            prefetch_a_to_lds_half_by_high_waves(next_k, lds_a_ping)
+            accs_mid = compute_tile_if(accs_in, low_waves, k_iv, lds_a_pong)
+            _asm_wait_vmcnt_then_barrier(0)
+            a0_prefetch_pong = prefetch_a0_pack(lds_a_pong)
+            accs_mid = compute_tile_if(
+                accs_mid, high_waves, k_iv, lds_a_pong, a0_prefetch=a0_prefetch_pong
+            )
+            _asm_barrier()
+
+            accs_mid = compute_tile_if(accs_mid, low_waves, next_k, lds_a_ping)
+            _asm_barrier()
+            a0_prefetch_ping = prefetch_a0_pack(lds_a_ping)
+            accs_out = compute_tile_if(
+                accs_mid, high_waves, next_k, lds_a_ping, a0_prefetch=a0_prefetch_ping
+            )
+            _asm_barrier()
+            return accs_out
+
+        if const_expr(bool(aonly_wave_pingpong)):
+            rocdl.sched_barrier(0)
+
+            k0 = fx.Index(0)
+            prefetch_a_to_lds_half_by_high_waves(k0, lds_a_pong)
+            _asm_wait_vmcnt_then_barrier(0)
+
+            init_state = [acc_init] * n_accs
+            results = init_state
+            c_k_stop = K - (tile_k * 2)
+            for iv, state in range(0, c_k_stop, tile_k * 2, init=init_state):
+                results = yield aonly_pair_body(iv, state)
+
+            tail_k = fx.Index(K - (tile_k * 2))
+            final_accs = aonly_tail_pair(tail_k, results)
+            scales = prefetch_output_scales()
+            store_output(final_accs, scales)
+            return
 
         def pingpong_body(k_iv, inner_state):
             accs, b_flat, a0_prefetch = unpack_state(inner_state)
@@ -649,4 +817,14 @@ def compile_preshuffle_gemm_fp8_8wave(
     return launch_gemm
 
 
-__all__ = ["compile_preshuffle_gemm_fp8_8wave"]
+def compile_preshuffle_gemm_fp8_8wave_aonly_pingpong(**kwargs):
+    """Compile the experimental A-only wave-specialized prefetch variant."""
+
+    kwargs["aonly_wave_pingpong"] = True
+    return compile_preshuffle_gemm_fp8_8wave(**kwargs)
+
+
+__all__ = [
+    "compile_preshuffle_gemm_fp8_8wave",
+    "compile_preshuffle_gemm_fp8_8wave_aonly_pingpong",
+]
