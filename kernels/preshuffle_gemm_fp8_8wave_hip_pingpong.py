@@ -544,7 +544,7 @@ def compile_preshuffle_gemm_fp8_8wave_hip_pingpong(
         llvm.InlineAsmOp(None, [], "s_waitcnt vmcnt(6)\ns_barrier", "", has_side_effects=True)
 
         # -------------------------------------------------------------------
-        # Stage 2: steady-state HIP-style ping-pong.
+        # Stage 2: steady-state ping-pong.
         # One wave_m group computes while the other copies the next slab.
         # -------------------------------------------------------------------
 
