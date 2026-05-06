@@ -6,7 +6,7 @@
 This kernel is intentionally narrow:
 - FP8 E4M3 inputs, row-wise fp32 scales, bf16/fp16 output.
 - Fixed 256x256x128 tile shape.
-- B is passed in the existing preshuffled test layout and copied into LDS.
+- A and B are raw row-major / k-major tensors: A[M, K], B[N, K].
 
 The hot K-loop uses two wave_m groups. One group computes while the other
 copies the next LDS half-tile, then they swap.
@@ -39,6 +39,36 @@ _B0_OFF = _HALF_TILE_BYTES
 _A1_OFF = 2 * _HALF_TILE_BYTES
 _B1_OFF = 3 * _HALF_TILE_BYTES
 
+_GRID_AUTO = "auto"
+_GRID_2D = "2d"
+_GRID_FLAT = "flat"
+_GRID_GROUPED_M = "grouped_m"
+
+_DEFAULT_GROUP_M = 4
+_AUTO_FLAT_MIN_N = 10240
+_AUTO_GROUPED_N = 12288
+
+
+def _resolve_grid_mapping(n: int, grid_mapping: str, group_m: int) -> tuple[str, int]:
+    valid = {_GRID_AUTO, _GRID_2D, _GRID_FLAT, _GRID_GROUPED_M}
+    if grid_mapping not in valid:
+        raise ValueError(f"grid_mapping must be one of {sorted(valid)}, got {grid_mapping!r}")
+
+    group_m = int(group_m)
+    if group_m <= 0:
+        raise ValueError(f"group_m must be positive, got {group_m}")
+
+    if grid_mapping != _GRID_AUTO:
+        return grid_mapping, group_m
+
+    # The fixed 256x256x128 kernel is sensitive to tile launch order. Keep the
+    # default policy explicit so benchmark-specific choices can be overridden.
+    if int(n) == _AUTO_GROUPED_N:
+        return _GRID_GROUPED_M, _DEFAULT_GROUP_M
+    if int(n) >= _AUTO_FLAT_MIN_N:
+        return _GRID_FLAT, group_m
+    return _GRID_2D, group_m
+
 
 # ---------------------------------------------------------------------------
 # Compile-time setup
@@ -60,11 +90,13 @@ def compile_preshuffle_gemm_fp8_8wave_hip_pingpong(
     use_async_copy: bool = True,
     dsrd_preload: int = -1,
     dvmem_preload: int = -1,
+    grid_mapping: str = _GRID_AUTO,
+    group_m: int = _DEFAULT_GROUP_M,
 ):
     """Compile the experimental HIP-style 8-wave FP8 GEMM.
 
     Signature:
-      launch(c, a_fp8, b_preshuffled_fp8, scale_a_f32, scale_b_f32,
+      launch(c, a_fp8, b_raw_fp8, scale_a_f32, scale_b_f32,
              unused_bias, M, N, stream)
     """
 
@@ -91,34 +123,33 @@ def compile_preshuffle_gemm_fp8_8wave_hip_pingpong(
     Vec = fx.Vector
     fp8_dtype = fx.Float8E4M3FN
     out_type = fx.BFloat16 if out_is_bf16 else fx.Float16
-    b_stride_nlane = 16
-    b_stride_klane = 16 * b_stride_nlane
-    b_stride_k0 = 4 * b_stride_klane
-    b_stride_n0 = (K // 64) * b_stride_k0
+    selected_grid, selected_group_m = _resolve_grid_mapping(N, grid_mapping, group_m)
+    use_flat_grid = selected_grid != _GRID_2D
+    use_grouped_grid = selected_grid == _GRID_GROUPED_M
 
     # -----------------------------------------------------------------------
     # MFMA helpers
     # -----------------------------------------------------------------------
+
+    def _raw_value(v):
+        return v.ir_value() if const_expr(hasattr(v, "ir_value")) else v
+
+    def _mfma_f32_f8(a_reg, b_reg, acc, result_type):
+        return Vec(llvm.inline_asm(
+            result_type,
+            [_raw_value(a_reg), _raw_value(b_reg), _raw_value(acc)],
+            "v_mfma_f32_16x16x128_f8f6f4 $0, $1, $2, $3",
+            "=v,v,v,v",
+            has_side_effects=False,
+            is_align_stack=False,
+        ))
 
     def _mfma_tile(accs_in, a_regs, b_regs, mfma_res_ty):
         accs = list(accs_in)
         for mi in range_constexpr(4):
             for ni in range_constexpr(2):
                 idx = mi * 2 + ni
-                accs[idx] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
-                    mfma_res_ty,
-                    [
-                        a_regs[mi],
-                        b_regs[ni],
-                        accs[idx],
-                        0,
-                        0,
-                        0,
-                        0x7F7F7F7F,
-                        0,
-                        0x7F7F7F7F,
-                    ],
-                )
+                accs[idx] = _mfma_f32_f8(a_regs[mi], b_regs[ni], accs[idx], mfma_res_ty)
         return accs
 
     def _mfma_all_waves(accs_in, a_regs, b_regs, mfma_res_ty):
@@ -159,8 +190,9 @@ def compile_preshuffle_gemm_fp8_8wave_hip_pingpong(
         rsrc,
         lds_buffer,
         lds_region_off: int,
-        global_byte_idx0,
-        global_byte_idx1,
+        soffset,
+        voffset0,
+        voffset1,
         wave_id,
     ):
         from flydsl._mlir.dialects import memref as memref_dialect
@@ -178,31 +210,19 @@ def compile_preshuffle_gemm_fp8_8wave_hip_pingpong(
             lds_ptr0, static_byte_offset=64 * _TILE_K
         )
 
-        for lds_ptr, global_byte_idx in (
-            (lds_ptr0, global_byte_idx0),
-            (lds_ptr1, global_byte_idx1),
+        for lds_ptr, voffset in (
+            (lds_ptr0, voffset0),
+            (lds_ptr1, voffset1),
         ):
             rocdl.raw_ptr_buffer_load_lds(
-                rsrc, lds_ptr, fx.Int32(16), fx.Int32(global_byte_idx),
-                fx.Int32(0), fx.Int32(0), fx.Int32(1))
+                rsrc, lds_ptr, fx.Int32(16), fx.Int32(voffset),
+                fx.Int32(soffset), fx.Int32(0), fx.Int32(1))
 
-    def _a_global_byte(base_k, half: int, row_local, col_swz, bx_m):
-        row_g = bx_m + fx.Index(half * _HALF_MN) + row_local
-        return row_g * fx.Index(K) + base_k + col_swz
+    def _slab_soffset(base_k, half: int, tile_base):
+        return (tile_base + fx.Index(half * _HALF_MN)) * fx.Index(K) + base_k
 
-    def _b_global_byte(base_k, half: int, row_local, col_swz, by_n):
-        n_g = by_n + fx.Index(half * _HALF_MN) + row_local
-        k_abs = base_k + col_swz
-        n_blk = n_g // fx.Index(16)
-        n_intra = n_g % fx.Index(16)
-        k0 = k_abs // fx.Index(64)
-        klane = (k_abs % fx.Index(64)) // fx.Index(16)
-        return (
-            n_blk * fx.Index(b_stride_n0)
-            + k0 * fx.Index(b_stride_k0)
-            + klane * fx.Index(b_stride_klane)
-            + n_intra * fx.Index(b_stride_nlane)
-        )
+    def _local_voffset(row_local, col_swz):
+        return row_local * fx.Index(K) + col_swz
 
     def _dma_a_half(
         a_rsrc,
@@ -224,8 +244,9 @@ def compile_preshuffle_gemm_fp8_8wave_hip_pingpong(
             a_rsrc,
             lds_buffer,
             lds_off,
-            _a_global_byte(base_k, half, row0, col0, bx_m),
-            _a_global_byte(base_k, half, row1, col1, bx_m),
+            _slab_soffset(base_k, half, bx_m),
+            _local_voffset(row0, col0),
+            _local_voffset(row1, col1),
             wave_id,
         )
 
@@ -249,8 +270,9 @@ def compile_preshuffle_gemm_fp8_8wave_hip_pingpong(
             b_rsrc,
             lds_buffer,
             lds_off,
-            _b_global_byte(base_k, half, row0, col0, by_n),
-            _b_global_byte(base_k, half, row1, col1, by_n),
+            _slab_soffset(base_k, half, by_n),
+            _local_voffset(row0, col0),
+            _local_voffset(row1, col1),
             wave_id,
         )
 
@@ -461,8 +483,24 @@ def compile_preshuffle_gemm_fp8_8wave_hip_pingpong(
         c_m = fx.Index(i32_m)
         c_n = fx.Index(i32_n)
         tx = gpu.thread_id("x")
-        bx = gpu.block_id("x")
-        by = gpu.block_id("y")
+
+        if const_expr(use_flat_grid):
+            bid = gpu.block_id("x")
+            tiles_n = fx.Index(N // _TILE_N)
+            if const_expr(use_grouped_grid):
+                group_m_i = fx.Index(selected_group_m)
+                group_size = group_m_i * tiles_n
+                group_id = bid // group_size
+                pid = bid % group_size
+                bx = group_id * group_m_i + (pid % group_m_i)
+                by = pid // group_m_i
+            else:
+                bx = bid // tiles_n
+                by = bid % tiles_n
+        else:
+            bx = gpu.block_id("x")
+            by = gpu.block_id("y")
+
         bx_m = bx * _TILE_M
         by_n = by * _TILE_N
 
@@ -762,11 +800,18 @@ def compile_preshuffle_gemm_fp8_8wave_hip_pingpong(
                         op.attributes["rocdl.waves_per_eu"] = ir.IntegerAttr.get(
                             fx.Int32.ir_type, waves
                         )
-        launcher.launch(
-            grid=(gx, gy, 1),
-            block=(_TOTAL_THREADS, 1, 1),
-            stream=stream,
-        )
+        if const_expr(use_flat_grid):
+            launcher.launch(
+                grid=(gx * gy, 1, 1),
+                block=(_TOTAL_THREADS, 1, 1),
+                stream=stream,
+            )
+        else:
+            launcher.launch(
+                grid=(gx, gy, 1),
+                block=(_TOTAL_THREADS, 1, 1),
+                stream=stream,
+            )
 
     return launch_gemm
 

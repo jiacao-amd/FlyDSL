@@ -110,6 +110,8 @@ def test_mfma_a8_flyc_preshuffle(
     use_8wave_kernel: bool = False,
     use_8wave_aonly_pingpong: bool = False,
     use_8wave_hip_pingpong: bool = False,
+    grid_mapping: str = "auto",
+    group_m: int = 4,
     skip_verify: bool = False,
 ):
     """Preshuffle GEMM using the @flyc.kernel / @flyc.jit API."""
@@ -148,6 +150,8 @@ def test_mfma_a8_flyc_preshuffle(
                 dsrd_preload=int(dsrd_preload),
                 dvmem_preload=int(dvmem_preload),
                 waves_per_eu=_wpe,
+                grid_mapping=str(grid_mapping),
+                group_m=int(group_m),
             )
             kernel_name = "8-wave-hip-pingpong"
         elif bool(use_8wave_aonly_pingpong):
@@ -190,9 +194,12 @@ def test_mfma_a8_flyc_preshuffle(
             waves_per_eu=_wpe,
         )
         kernel_name = "default"
+    grid_info = ""
+    if bool(use_8wave_hip_pingpong):
+        grid_info = f", grid_mapping={grid_mapping}, group_m={group_m}"
     print(
         f"✓ Kernel prepared (kernel={kernel_name}, lds_stage={lds_stage}, async_copy={use_async_copy}, "
-        f"waves_per_eu={_wpe}, dsrd_preload={dsrd_preload}, dvmem_preload={dvmem_preload})"
+        f"waves_per_eu={_wpe}, dsrd_preload={dsrd_preload}, dvmem_preload={dvmem_preload}{grid_info})"
     )
 
     size_c = M * N
@@ -252,7 +259,10 @@ def test_mfma_a8_flyc_preshuffle(
         c_ref = run_torch(a_q, b_q, scale_a, scale_b, bias=None, dtype=torch.float32)
     c_out_raw = torch.zeros((M, N), dtype=torch_out_dtype, device=device)
 
-    b_input = b_packed if is_int4 else b_shuffled
+    if bool(use_8wave_hip_pingpong):
+        b_input = b_q
+    else:
+        b_input = b_packed if is_int4 else b_shuffled
     if scale_a is None:
         sa_flat = torch.empty((0,), device=device, dtype=torch.float32)
     else:
@@ -502,6 +512,10 @@ if __name__ == "__main__":
     parser.add_argument("--skip_verify", action="store_true", default=False,
                         help="Skip torch reference and correctness check for benchmark-only runs.")
     parser.add_argument("--waves_per_eu", type=int, default=0, choices=[0, 1, 2, 3, 4])
+    parser.add_argument("--grid_mapping", choices=["auto", "2d", "flat", "grouped_m"], default="auto",
+                        help="Tile launch order for --use_8wave_hip_pingpong.")
+    parser.add_argument("--group_m", type=int, default=4,
+                        help="M-tile group size used by --grid_mapping grouped_m.")
     parser.add_argument("--run_aiter_bench", action="store_true", default=DEFAULT_RUN_AITER_BENCH)
     parser.add_argument("--no_aiter_bench", action="store_false", dest="run_aiter_bench")
     parser.add_argument("--test_graph", "-tg", action="store_true", default=False)
@@ -537,6 +551,8 @@ if __name__ == "__main__":
                 use_8wave_kernel=bool(args.use_8wave_kernel),
                 use_8wave_aonly_pingpong=bool(args.use_8wave_aonly_pingpong),
                 use_8wave_hip_pingpong=bool(args.use_8wave_hip_pingpong),
+                grid_mapping=str(args.grid_mapping),
+                group_m=int(args.group_m),
                 skip_verify=bool(args.skip_verify),
             )
         else:
