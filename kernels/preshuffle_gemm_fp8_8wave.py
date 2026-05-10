@@ -57,7 +57,6 @@ def compile_preshuffle_gemm_fp8_8wave(
     use_async_copy: bool = True,
     dsrd_preload: int = -1,
     dvmem_preload: int = -1,
-    aonly_wave_pingpong: bool = False,
 ):
     """Compile the raw-B 8-wave FP8 ping-pong GEMM.
 
@@ -66,7 +65,7 @@ def compile_preshuffle_gemm_fp8_8wave(
              unused_bias, M, N, stream)
     """
 
-    del M, N, dsrd_preload, dvmem_preload, aonly_wave_pingpong
+    del M, N, dsrd_preload, dvmem_preload
 
     if int(tile_m) != _TILE_M or int(tile_n) != _TILE_N or int(tile_k) != _TILE_K:
         raise ValueError("8-wave FP8 ping-pong only supports 256x256x128 tiles")
@@ -531,12 +530,4 @@ def compile_preshuffle_gemm_fp8_8wave(
     return launch_gemm
 
 
-def compile_preshuffle_gemm_fp8_8wave_aonly_pingpong(**kwargs):
-    kwargs["aonly_wave_pingpong"] = True
-    return compile_preshuffle_gemm_fp8_8wave(**kwargs)
-
-
-__all__ = [
-    "compile_preshuffle_gemm_fp8_8wave",
-    "compile_preshuffle_gemm_fp8_8wave_aonly_pingpong",
-]
+__all__ = ["compile_preshuffle_gemm_fp8_8wave"]

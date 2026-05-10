@@ -31,7 +31,6 @@ from kernels.preshuffle_gemm import compile_preshuffle_gemm_a8
 from kernels.preshuffle_gemm import compile_preshuffle_gemm_w4
 from kernels.preshuffle_gemm_fp8_8wave import (
     compile_preshuffle_gemm_fp8_8wave,
-    compile_preshuffle_gemm_fp8_8wave_aonly_pingpong,
 )
 from kernels.preshuffle_gemm_fp8_8wave_hip_pingpong import (
     compile_preshuffle_gemm_fp8_8wave_hip_pingpong,
@@ -108,7 +107,6 @@ def test_mfma_a8_flyc_preshuffle(
     dsrd_preload: int = 2,
     dvmem_preload: int = 2,
     use_8wave_kernel: bool = False,
-    use_8wave_aonly_pingpong: bool = False,
     use_8wave_hip_pingpong: bool = False,
     grid_mapping: str = "auto",
     group_m: int = 4,
@@ -132,11 +130,11 @@ def test_mfma_a8_flyc_preshuffle(
     _wpe = None if _wpe <= 0 else _wpe
     num_8wave_modes = sum(
         int(bool(v))
-        for v in (use_8wave_kernel, use_8wave_aonly_pingpong, use_8wave_hip_pingpong)
+        for v in (use_8wave_kernel, use_8wave_hip_pingpong)
     )
     if num_8wave_modes > 1:
         raise ValueError("8-wave kernel modes are mutually exclusive")
-    if bool(use_8wave_kernel) or bool(use_8wave_aonly_pingpong) or bool(use_8wave_hip_pingpong):
+    if bool(use_8wave_kernel) or bool(use_8wave_hip_pingpong):
         if in_dtype != "fp8":
             raise ValueError("8-wave kernels currently support only --in_dtype fp8")
         if bool(use_8wave_hip_pingpong):
@@ -154,19 +152,6 @@ def test_mfma_a8_flyc_preshuffle(
                 group_m=int(group_m),
             )
             kernel_name = "8-wave-hip-pingpong"
-        elif bool(use_8wave_aonly_pingpong):
-            launch_fn = compile_preshuffle_gemm_fp8_8wave_aonly_pingpong(
-                M=M, N=N, K=K,
-                tile_m=tile_m, tile_n=tile_n, tile_k=tile_k,
-                out_dtype=out_dtype,
-                lds_stage=lds_stage,
-                use_cshuffle_epilog=bool(use_cshuffle_epilog),
-                use_async_copy=bool(use_async_copy),
-                dsrd_preload=int(dsrd_preload),
-                dvmem_preload=int(dvmem_preload),
-                waves_per_eu=_wpe,
-            )
-            kernel_name = "8-wave-aonly-pingpong"
         else:
             launch_fn = compile_preshuffle_gemm_fp8_8wave(
                 M=M, N=N, K=K,
@@ -259,7 +244,7 @@ def test_mfma_a8_flyc_preshuffle(
         c_ref = run_torch(a_q, b_q, scale_a, scale_b, bias=None, dtype=torch.float32)
     c_out_raw = torch.zeros((M, N), dtype=torch_out_dtype, device=device)
 
-    if bool(use_8wave_kernel) or bool(use_8wave_aonly_pingpong) or bool(use_8wave_hip_pingpong):
+    if bool(use_8wave_kernel) or bool(use_8wave_hip_pingpong):
         b_input = b_q
     else:
         b_input = b_packed if is_int4 else b_shuffled
@@ -505,8 +490,6 @@ if __name__ == "__main__":
     parser.add_argument("--use_cshuffle_epilog", action="store_true", default=False)
     parser.add_argument("--use_8wave_kernel", action="store_true", default=False,
                         help="Run the compact 8-wave row-wise FP8 kernel.")
-    parser.add_argument("--use_8wave_aonly_pingpong", action="store_true", default=False,
-                        help="Run the experimental A-only wave-specialized 8-wave kernel.")
     parser.add_argument("--use_8wave_hip_pingpong", action="store_true", default=False,
                         help="Run the experimental HIP-style 8-wave ping-pong FP8 kernel.")
     parser.add_argument("--skip_verify", action="store_true", default=False,
@@ -529,8 +512,6 @@ if __name__ == "__main__":
                 raise ValueError("--in_dtype fp4 requires --wfp4")
             if args.use_8wave_kernel and args.in_dtype != "fp8":
                 raise ValueError("--use_8wave_kernel only supports --in_dtype fp8")
-            if args.use_8wave_aonly_pingpong and args.in_dtype != "fp8":
-                raise ValueError("--use_8wave_aonly_pingpong only supports --in_dtype fp8")
             if args.use_8wave_hip_pingpong and args.in_dtype != "fp8":
                 raise ValueError("--use_8wave_hip_pingpong only supports --in_dtype fp8")
             test_mfma_a8_flyc_preshuffle(
@@ -549,7 +530,6 @@ if __name__ == "__main__":
                 use_cshuffle_epilog=bool(args.use_cshuffle_epilog),
                 waves_per_eu=int(args.waves_per_eu),
                 use_8wave_kernel=bool(args.use_8wave_kernel),
-                use_8wave_aonly_pingpong=bool(args.use_8wave_aonly_pingpong),
                 use_8wave_hip_pingpong=bool(args.use_8wave_hip_pingpong),
                 grid_mapping=str(args.grid_mapping),
                 group_m=int(args.group_m),
