@@ -259,7 +259,7 @@ def test_mfma_a8_flyc_preshuffle(
         c_ref = run_torch(a_q, b_q, scale_a, scale_b, bias=None, dtype=torch.float32)
     c_out_raw = torch.zeros((M, N), dtype=torch_out_dtype, device=device)
 
-    if bool(use_8wave_hip_pingpong):
+    if bool(use_8wave_kernel) or bool(use_8wave_aonly_pingpong) or bool(use_8wave_hip_pingpong):
         b_input = b_q
     else:
         b_input = b_packed if is_int4 else b_shuffled
