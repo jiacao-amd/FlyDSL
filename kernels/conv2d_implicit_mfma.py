@@ -17,7 +17,7 @@ from kernels.tensor_shim import GTensor, STensor, _run_compiled
 TILE_M = 96
 TILE_N = 64
 TILE_K = 32
-STAGES = 2
+STAGES = 3
 
 BLOCK_M_WARPS = 2
 BLOCK_N_WARPS = 1
@@ -120,12 +120,23 @@ def compile_conv2d_implicit_mfma(n, c, h, width, k, r, s):
         def barrier(vmcnt=0):
             llvm.InlineAsmOp(None, [], f"s_waitcnt vmcnt({vmcnt})\n\ts_barrier", "", has_side_effects=True)
 
-        def load_a_regs(k_base):
-            rs = k_base // c
-            rr = rs // s
-            ss = rs % s
-            base_c = k_base % c
-            regs = []
+        def dma_warp_offset():
+            return rocdl.readfirstlane(
+                T.i64,
+                arith.index_cast(T.i64, fx.Index(wid) * arith.constant(WARP_SIZE * DMA_BYTES, index=True)),
+            )
+
+        def buffer_load_to_lds(rsrc, lds_ptr, global_offset):
+            llvm.InlineAsmOp(
+                None,
+                [lds_ptr, global_offset, rsrc],
+                "s_mov_b32 m0, $0\n\tbuffer_load_dwordx4 $1, $2, 0 offen sc0 lds",
+                "s,v,s",
+                has_side_effects=True,
+            )
+
+        def load_a_to_lds(k_base, stage):
+            warp_lds_off = dma_warp_offset()
             for i in range_constexpr(LDG_A_COUNT):
                 linear = tid * LDG_VEC + i * BLOCK_VECS
                 local_m = linear // TILE_K
@@ -135,22 +146,28 @@ def compile_conv2d_implicit_mfma(n, c, h, width, k, r, s):
                 pq = row % (p * q)
                 pp = pq // q
                 qq = pq % q
-                regs.append(x_g.vec_load((n_idx, pp + rr, qq + ss, base_c + local_k), LDG_VEC))
-            return regs
+                col_bytes = swizzle_xor16(local_m, local_k * 2)
+                k_abs = fx.Index(k_base) + fx.Index(col_bytes // 2)
+                rs = k_abs // c
+                rr = rs // s
+                ss = rs % s
+                cc = k_abs % c
 
-        def store_a_regs(regs, stage):
-            for i in range_constexpr(LDG_A_COUNT):
-                linear = tid * LDG_VEC + i * BLOCK_VECS
-                local_m = linear // TILE_K
-                local_k = linear % TILE_K
-                col = swizzle_xor16(local_m, local_k * 2) // 2
-                a_lds.vec_store((fx.Index(stage), fx.Index(local_m), fx.Index(col)), regs[i], LDG_VEC)
+                g_off = x_g.linear_offset((n_idx, pp + rr, qq + ss, cc)) * 2
+                g_off = arith.index_cast(T.i32, g_off)
+
+                if const_expr(i == 0):
+                    lds_off = a_lds.linear_offset((fx.Index(stage), fx.Index(0), fx.Index(0))) * 2
+                    lds_base = memref.extract_aligned_pointer_as_index(a_lds.memptr) + lds_off
+                    lds_ptr_base = buffer_ops.create_llvm_ptr(arith.index_cast(T.i64, lds_base), address_space=3)
+                    lds_ptr = buffer_ops.get_element_ptr(lds_ptr_base, warp_lds_off)
+                else:
+                    lds_ptr = buffer_ops.get_element_ptr(lds_ptr, static_byte_offset=BLOCK_THREADS * DMA_BYTES)
+
+                buffer_load_to_lds(x_g.rsrc, lds_ptr, g_off)
 
         def load_b_to_lds(k_base, stage):
-            warp_lds_off = rocdl.readfirstlane(
-                T.i64,
-                arith.index_cast(T.i64, fx.Index(wid) * arith.constant(WARP_SIZE * DMA_BYTES, index=True)),
-            )
+            warp_lds_off = dma_warp_offset()
             for i in range_constexpr(LDG_B_COUNT):
                 linear = tid * LDG_VEC + i * BLOCK_VECS
                 local_n = linear // TILE_K
@@ -168,13 +185,7 @@ def compile_conv2d_implicit_mfma(n, c, h, width, k, r, s):
                 else:
                     lds_ptr = buffer_ops.get_element_ptr(lds_ptr, static_byte_offset=BLOCK_THREADS * DMA_BYTES)
 
-                llvm.InlineAsmOp(
-                    None,
-                    [lds_ptr, g_off, w_g.rsrc],
-                    "s_mov_b32 m0, $0\n\tbuffer_load_dwordx4 $1, $2, 0 offen sc0 lds",
-                    "s,v,s",
-                    has_side_effects=True,
-                )
+                buffer_load_to_lds(w_g.rsrc, lds_ptr, g_off)
 
         def compute_stage(stage, old_accs):
             new_accs = [a for a in old_accs]
@@ -208,24 +219,32 @@ def compile_conv2d_implicit_mfma(n, c, h, width, k, r, s):
                     rocdl.sched_mfma(WARP_N_STEPS)
             rocdl.sched_barrier(0)
 
-        load_b_to_lds(0, 0)
-        store_a_regs(load_a_regs(0), 0)
+        for preload in range_constexpr(STAGES - 1):
+            preload_k = preload * TILE_K
+            load_b_to_lds(preload_k, preload)
+            load_a_to_lds(preload_k, preload)
         barrier()
 
         stage = 0
-        for kt in range_constexpr(k_tiles - 1):
-            next_stage = 1 - stage
-            next_k = (kt + 1) * TILE_K
-            load_b_to_lds(next_k, next_stage)
-            next_a = load_a_regs(next_k)
-            accs = compute_stage(stage, accs)
-            store_a_regs(next_a, next_stage)
-            hot_loop_scheduler()
+        for kt in range_constexpr(k_tiles - (STAGES - 1)):
+            write_stage = (stage + STAGES - 1) % STAGES
+            next_k = (kt + STAGES - 1) * TILE_K
             barrier()
-            stage = next_stage
+            load_b_to_lds(next_k, write_stage)
+            load_a_to_lds(next_k, write_stage)
+            rocdl.s_setprio(1)
+            accs = compute_stage(stage, accs)
+            rocdl.s_setprio(0)
+            hot_loop_scheduler()
+            stage = (stage + 1) % STAGES
 
-        accs = compute_stage(stage, accs)
-        hot_loop_scheduler()
+        for tail in range_constexpr(STAGES - 1):
+            barrier()
+            rocdl.s_setprio(1)
+            accs = compute_stage(stage, accs)
+            rocdl.s_setprio(0)
+            hot_loop_scheduler()
+            stage = (stage + 1) % STAGES
 
         c_m_vec = lane // MFMA_N * MFMA_C_VALUES
         c_n = lane % MFMA_N
