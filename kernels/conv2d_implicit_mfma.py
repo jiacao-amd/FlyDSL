@@ -14,19 +14,15 @@ from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 from kernels.tensor_shim import GTensor, STensor, _run_compiled
 
 
-TILE_M = 144
+TILE_M = 96
 TILE_N = 64
 TILE_K = 32
 STAGES = 3
 
-COMPUTE_WAVES = 3
-LOADER_WAVES = 1
-BLOCK_M_WARPS = COMPUTE_WAVES
+BLOCK_M_WARPS = 2
 BLOCK_N_WARPS = 1
 WARP_SIZE = 64
-BLOCK_THREADS = (COMPUTE_WAVES + LOADER_WAVES) * WARP_SIZE
-LOAD_THREADS = LOADER_WAVES * WARP_SIZE
-COMPUTE_THREADS = COMPUTE_WAVES * WARP_SIZE
+BLOCK_THREADS = BLOCK_M_WARPS * BLOCK_N_WARPS * WARP_SIZE
 
 MFMA_M = 16
 MFMA_N = 16
@@ -43,11 +39,10 @@ WARP_K_STEPS = TILE_K // MFMA_K
 
 LDG_VEC = 8
 DMA_BYTES = 16
-LOAD_BLOCK_VECS = LDG_VEC * LOAD_THREADS
-STORE_BLOCK_VECS = LDG_VEC * COMPUTE_THREADS
-LDG_A_COUNT = TILE_M * TILE_K // LOAD_BLOCK_VECS
-LDG_B_COUNT = TILE_N * TILE_K // LOAD_BLOCK_VECS
-LDG_C_COUNT = TILE_M * TILE_N // STORE_BLOCK_VECS
+BLOCK_VECS = LDG_VEC * BLOCK_THREADS
+LDG_A_COUNT = TILE_M * TILE_K // BLOCK_VECS
+LDG_B_COUNT = TILE_N * TILE_K // BLOCK_VECS
+LDG_C_COUNT = TILE_M * TILE_N // BLOCK_VECS
 
 
 def swizzle_xor16(row, col_in_bytes):
@@ -61,11 +56,10 @@ def compile_conv2d_implicit_mfma(n, c, h, width, k, r, s):
     npq = n * p * q
     crs = c * r * s
     k_tiles = crs // TILE_K
-    grid_m = npq // TILE_M
+    grid_m = (npq + TILE_M - 1) // TILE_M
 
     assert c % LDG_VEC == 0
     assert crs % TILE_K == 0
-    assert npq % TILE_M == 0
     assert k == TILE_N
 
     allocator = SmemAllocator(None, arch=get_rocm_arch(), global_sym_name=f"conv_smem_{n}_{c}_{h}_{width}_{k}")
@@ -106,12 +100,10 @@ def compile_conv2d_implicit_mfma(n, c, h, width, k, r, s):
         tid = fx.thread_idx.x
         pid = fx.block_idx.x
         m_offset = pid * TILE_M
+        npq_i32 = arith.constant(npq, type=T.i32)
 
         wid = tid // WARP_SIZE
         lane = tid % WARP_SIZE
-        is_compute_wave = arith.cmpi(arith.CmpIPredicate.ult, fx.Index(wid), fx.Index(COMPUTE_WAVES))
-        is_loader_wave = arith.cmpi(arith.CmpIPredicate.uge, fx.Index(wid), fx.Index(COMPUTE_WAVES))
-
         wave_m = wid // BLOCK_N_WARPS
         wave_n = wid % BLOCK_N_WARPS
 
@@ -128,17 +120,10 @@ def compile_conv2d_implicit_mfma(n, c, h, width, k, r, s):
         def barrier(vmcnt=0):
             llvm.InlineAsmOp(None, [], f"s_waitcnt vmcnt({vmcnt})\n\ts_barrier", "", has_side_effects=True)
 
-        def loader_tid():
-            return (wid - COMPUTE_WAVES) * WARP_SIZE + lane
-
-        def compute_tid():
-            return wid * WARP_SIZE + lane
-
         def dma_warp_offset():
-            loader_wave = wid - COMPUTE_WAVES
             return rocdl.readfirstlane(
                 T.i64,
-                arith.index_cast(T.i64, fx.Index(loader_wave) * arith.constant(WARP_SIZE * DMA_BYTES, index=True)),
+                arith.index_cast(T.i64, fx.Index(wid) * arith.constant(WARP_SIZE * DMA_BYTES, index=True)),
             )
 
         def buffer_load_to_lds(rsrc, lds_ptr, global_offset):
@@ -153,7 +138,7 @@ def compile_conv2d_implicit_mfma(n, c, h, width, k, r, s):
         def load_a_to_lds(k_base, stage):
             warp_lds_off = dma_warp_offset()
             for i in range_constexpr(LDG_A_COUNT):
-                linear = loader_tid() * LDG_VEC + i * LOAD_BLOCK_VECS
+                linear = tid * LDG_VEC + i * BLOCK_VECS
                 local_m = linear // TILE_K
                 local_k = linear % TILE_K
                 row = m_offset + local_m
@@ -177,14 +162,21 @@ def compile_conv2d_implicit_mfma(n, c, h, width, k, r, s):
                     lds_ptr_base = buffer_ops.create_llvm_ptr(arith.index_cast(T.i64, lds_base), address_space=3)
                     lds_ptr = buffer_ops.get_element_ptr(lds_ptr_base, warp_lds_off)
                 else:
-                    lds_ptr = buffer_ops.get_element_ptr(lds_ptr, static_byte_offset=LOAD_THREADS * DMA_BYTES)
+                    lds_ptr = buffer_ops.get_element_ptr(lds_ptr, static_byte_offset=BLOCK_THREADS * DMA_BYTES)
 
-                buffer_load_to_lds(x_g.rsrc, lds_ptr, g_off)
+                if const_expr(npq % TILE_M == 0):
+                    buffer_load_to_lds(x_g.rsrc, lds_ptr, g_off)
+                else:
+                    valid_row = arith.cmpi(arith.CmpIPredicate.ult, row, npq_i32)
+                    valid_if = scf.IfOp(valid_row, results_=[], has_else=False)
+                    with ir.InsertionPoint(valid_if.then_block):
+                        buffer_load_to_lds(x_g.rsrc, lds_ptr, g_off)
+                        scf.YieldOp([])
 
         def load_b_to_lds(k_base, stage):
             warp_lds_off = dma_warp_offset()
             for i in range_constexpr(LDG_B_COUNT):
-                linear = loader_tid() * LDG_VEC + i * LOAD_BLOCK_VECS
+                linear = tid * LDG_VEC + i * BLOCK_VECS
                 local_n = linear // TILE_K
                 local_k = linear % TILE_K
                 col_bytes = swizzle_xor16(local_n, local_k * 2)
@@ -198,7 +190,7 @@ def compile_conv2d_implicit_mfma(n, c, h, width, k, r, s):
                     lds_ptr_base = buffer_ops.create_llvm_ptr(arith.index_cast(T.i64, lds_base), address_space=3)
                     lds_ptr = buffer_ops.get_element_ptr(lds_ptr_base, warp_lds_off)
                 else:
-                    lds_ptr = buffer_ops.get_element_ptr(lds_ptr, static_byte_offset=LOAD_THREADS * DMA_BYTES)
+                    lds_ptr = buffer_ops.get_element_ptr(lds_ptr, static_byte_offset=BLOCK_THREADS * DMA_BYTES)
 
                 buffer_load_to_lds(w_g.rsrc, lds_ptr, g_off)
 
@@ -234,74 +226,62 @@ def compile_conv2d_implicit_mfma(n, c, h, width, k, r, s):
                     rocdl.sched_mfma(WARP_N_STEPS)
             rocdl.sched_barrier(0)
 
-        def issue_loads(k_base, stage):
-            load_if = scf.IfOp(is_loader_wave, results_=[], has_else=False)
-            with ir.InsertionPoint(load_if.then_block):
-                load_b_to_lds(k_base, stage)
-                load_a_to_lds(k_base, stage)
-                scf.YieldOp([])
-
-        def issue_compute(stage, old_accs):
-            compute_if = scf.IfOp(
-                is_compute_wave,
-                results_=[T.vec(MFMA_C_VALUES, T.f32)] * len(old_accs),
-                has_else=True,
-            )
-            with ir.InsertionPoint(compute_if.then_block):
-                rocdl.s_setprio(1)
-                new_accs = compute_stage(stage, old_accs)
-                rocdl.s_setprio(0)
-                hot_loop_scheduler()
-                scf.YieldOp(new_accs)
-            with ir.InsertionPoint(compute_if.else_block):
-                scf.YieldOp(old_accs)
-            return [compute_if.results[i] for i in range_constexpr(len(old_accs))]
-
         for preload in range_constexpr(STAGES - 1):
             preload_k = preload * TILE_K
-            issue_loads(preload_k, preload)
+            load_b_to_lds(preload_k, preload)
+            load_a_to_lds(preload_k, preload)
         barrier()
 
         stage = 0
         for kt in range_constexpr(k_tiles - (STAGES - 1)):
             write_stage = (stage + STAGES - 1) % STAGES
             next_k = (kt + STAGES - 1) * TILE_K
-            issue_loads(next_k, write_stage)
-            accs = issue_compute(stage, accs)
             barrier()
+            load_b_to_lds(next_k, write_stage)
+            load_a_to_lds(next_k, write_stage)
+            rocdl.s_setprio(1)
+            accs = compute_stage(stage, accs)
+            rocdl.s_setprio(0)
+            hot_loop_scheduler()
             stage = (stage + 1) % STAGES
 
         for tail in range_constexpr(STAGES - 1):
-            accs = issue_compute(stage, accs)
             barrier()
+            rocdl.s_setprio(1)
+            accs = compute_stage(stage, accs)
+            rocdl.s_setprio(0)
+            hot_loop_scheduler()
             stage = (stage + 1) % STAGES
 
         c_m_vec = lane // MFMA_N * MFMA_C_VALUES
         c_n = lane % MFMA_N
-        c_write_if = scf.IfOp(is_compute_wave, results_=[], has_else=False)
-        with ir.InsertionPoint(c_write_if.then_block):
-            for wm in range_constexpr(WARP_M_STEPS):
-                row = warp_m + wm * MFMA_M + c_m_vec
-                for wn in range_constexpr(WARP_N_STEPS):
-                    col = warp_n + wn * MFMA_N + c_n
-                    acc = accs[wm * WARP_N_STEPS + wn]
-                    for i in range_constexpr(MFMA_C_VALUES):
-                        c_lds[fx.Index(row + i), fx.Index(col)] = vector.extract(
-                            acc, static_position=[i], dynamic_position=[]
-                        ).truncf(T.f16)
-            scf.YieldOp([])
+        for wm in range_constexpr(WARP_M_STEPS):
+            row = warp_m + wm * MFMA_M + c_m_vec
+            for wn in range_constexpr(WARP_N_STEPS):
+                col = warp_n + wn * MFMA_N + c_n
+                acc = accs[wm * WARP_N_STEPS + wn]
+                for i in range_constexpr(MFMA_C_VALUES):
+                    c_lds[fx.Index(row + i), fx.Index(col)] = vector.extract(
+                        acc, static_position=[i], dynamic_position=[]
+                    ).truncf(T.f16)
 
         barrier()
 
-        store_if = scf.IfOp(is_compute_wave, results_=[], has_else=False)
-        with ir.InsertionPoint(store_if.then_block):
-            for i in range_constexpr(LDG_C_COUNT):
-                linear = compute_tid() * LDG_VEC + i * STORE_BLOCK_VECS
-                local_m = linear // TILE_N
-                local_n = linear % TILE_N
+        for i in range_constexpr(LDG_C_COUNT):
+            linear = tid * LDG_VEC + i * BLOCK_VECS
+            local_m = linear // TILE_N
+            local_n = linear % TILE_N
+            global_m = m_offset + local_m
+            if const_expr(npq % TILE_M == 0):
                 vals = c_lds.vec_load((fx.Index(local_m), fx.Index(local_n)), LDG_VEC)
-                y_g.vec_store((m_offset + local_m, local_n), vals, LDG_VEC)
-            scf.YieldOp([])
+                y_g.vec_store((global_m, local_n), vals, LDG_VEC)
+            else:
+                valid_row = arith.cmpi(arith.CmpIPredicate.ult, global_m, npq_i32)
+                valid_if = scf.IfOp(valid_row, results_=[], has_else=False)
+                with ir.InsertionPoint(valid_if.then_block):
+                    vals = c_lds.vec_load((fx.Index(local_m), fx.Index(local_n)), LDG_VEC)
+                    y_g.vec_store((global_m, local_n), vals, LDG_VEC)
+                    scf.YieldOp([])
 
     @flyc.jit
     def launch_conv2d_implicit_mfma(y: fx.Tensor, x: fx.Tensor, w: fx.Tensor, stream: fx.Stream = fx.Stream(None)):
@@ -314,7 +294,6 @@ def compile_conv2d_implicit_mfma(n, c, h, width, k, r, s):
             y,
             x,
             w,
-            value_attrs={"rocdl.waves_per_eu": 2, "rocdl.flat_work_group_size": "256,256"},
         ).launch(
             grid=(grid_m, 1, 1),
             block=(BLOCK_THREADS, 1, 1),
