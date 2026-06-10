@@ -14,12 +14,12 @@ from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 from kernels.tensor_shim import GTensor, STensor, _run_compiled
 
 
-TILE_M = 96
+TILE_M = 192
 TILE_N = 64
 TILE_K = 32
 STAGES = 3
 
-BLOCK_M_WARPS = 2
+BLOCK_M_WARPS = 4
 BLOCK_N_WARPS = 1
 WARP_SIZE = 64
 BLOCK_THREADS = BLOCK_M_WARPS * BLOCK_N_WARPS * WARP_SIZE
