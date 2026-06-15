@@ -214,18 +214,6 @@ def compile_conv2d_implicit_mfma(n, c, h, width, k, r, s):
                         )
             return new_accs
 
-        def hot_loop_scheduler():
-            for _ in range_constexpr(LDG_B_COUNT + LDG_A_COUNT):
-                rocdl.sched_vmem(1)
-            for _ in range_constexpr(WARP_K_STEPS):
-                for _ in range_constexpr(WARP_N_STEPS):
-                    rocdl.sched_dsrd(1)
-                for _ in range_constexpr(WARP_M_STEPS):
-                    rocdl.sched_dsrd(1)
-                for _ in range_constexpr(WARP_M_STEPS):
-                    rocdl.sched_mfma(WARP_N_STEPS)
-            rocdl.sched_barrier(0)
-
         for preload in range_constexpr(STAGES - 1):
             preload_k = preload * TILE_K
             load_b_to_lds(preload_k, preload)
@@ -242,7 +230,6 @@ def compile_conv2d_implicit_mfma(n, c, h, width, k, r, s):
             rocdl.s_setprio(1)
             accs = compute_stage(stage, accs)
             rocdl.s_setprio(0)
-            hot_loop_scheduler()
             stage = (stage + 1) % STAGES
 
         for tail in range_constexpr(STAGES - 1):
@@ -250,7 +237,6 @@ def compile_conv2d_implicit_mfma(n, c, h, width, k, r, s):
             rocdl.s_setprio(1)
             accs = compute_stage(stage, accs)
             rocdl.s_setprio(0)
-            hot_loop_scheduler()
             stage = (stage + 1) % STAGES
 
         c_m_vec = lane // MFMA_N * MFMA_C_VALUES
