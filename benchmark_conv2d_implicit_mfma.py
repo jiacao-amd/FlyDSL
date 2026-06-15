@@ -80,8 +80,9 @@ def bench_case(n: int, c: int, h: int, w_in: int, k: int, r: int, s: int, *, rou
     x = x_nchw.permute(0, 2, 3, 1).contiguous()
     w = w_kcrs.permute(0, 2, 3, 1).contiguous()
     y_flydsl = torch.empty((npq, k), device="cuda", dtype=torch.float16)
+    stream = torch.cuda.current_stream()
 
-    conv2d_implicit_mfma_(y_flydsl, x, w)
+    conv2d_implicit_mfma_(y_flydsl, x, w, stream)
     y_torch = F.conv2d(x_nchw, w_kcrs)
     torch.cuda.synchronize()
 
@@ -89,7 +90,7 @@ def bench_case(n: int, c: int, h: int, w_in: int, k: int, r: int, s: int, *, rou
     err = (y_flydsl - y_ref).abs().max().item()
 
     iters = 200 if h <= 32 else 100 if h <= 62 else 50
-    flydsl_ms = time_ms(lambda: conv2d_implicit_mfma_(y_flydsl, x, w), iters=iters, rounds=rounds)
+    flydsl_ms = time_ms(lambda: conv2d_implicit_mfma_(y_flydsl, x, w, stream), iters=iters, rounds=rounds)
     torch_ms = time_ms(lambda: F.conv2d(x_nchw, w_kcrs), iters=iters, rounds=rounds)
 
     del x_nchw, w_kcrs, x, w, y_flydsl, y_torch, y_ref
