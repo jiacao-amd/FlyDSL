@@ -4,8 +4,7 @@ import torch
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm, scf
+from flydsl._mlir.dialects import llvm
 from flydsl.expr import arith, buffer_ops, const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
@@ -87,7 +86,6 @@ def compile_conv2d_implicit_mfma(n, c, h, width, k, r, s, has_bias=False):
         tid = fx.thread_idx.x
         pid = fx.block_idx.x
         m_offset = pid * TILE_M
-        npq_i32 = arith.constant(npq, type=T.i32)
 
         wid = tid // WARP_SIZE
         lane = tid % WARP_SIZE
@@ -186,12 +184,8 @@ def compile_conv2d_implicit_mfma(n, c, h, width, k, r, s, has_bias=False):
 
                 if const_expr(npq % TILE_M == 0):
                     buffer_load_to_lds(x_rsrc, lds_ptr, g_off)
-                else:
-                    valid_row = arith.cmpi(arith.CmpIPredicate.ult, row, npq_i32)
-                    valid_if = scf.IfOp(valid_row, results_=[], has_else=False)
-                    with ir.InsertionPoint(valid_if.then_block):
-                        buffer_load_to_lds(x_rsrc, lds_ptr, g_off)
-                        scf.YieldOp([])
+                elif row < fx.Index(npq):
+                    buffer_load_to_lds(x_rsrc, lds_ptr, g_off)
 
         def load_b_to_lds(k_base, stage):
             warp_lds_off = dma_warp_offset()
@@ -290,13 +284,12 @@ def compile_conv2d_implicit_mfma(n, c, h, width, k, r, s, has_bias=False):
             if const_expr(npq % TILE_M == 0):
                 vals = lds_load_vec8(c_lds, c_lds_offset(fx.Index(local_m), fx.Index(local_n)))
                 buffer_ops.buffer_store(vals, y_rsrc, y_offset(global_m, local_n))
-            else:
-                valid_row = arith.cmpi(arith.CmpIPredicate.ult, global_m, npq_i32)
-                valid_if = scf.IfOp(valid_row, results_=[], has_else=False)
-                with ir.InsertionPoint(valid_if.then_block):
-                    vals = lds_load_vec8(c_lds, c_lds_offset(fx.Index(local_m), fx.Index(local_n)))
-                    buffer_ops.buffer_store(vals, y_rsrc, y_offset(global_m, local_n))
-                    scf.YieldOp([])
+            elif global_m < fx.Index(npq):
+                buffer_ops.buffer_store(
+                    lds_load_vec8(c_lds, c_lds_offset(fx.Index(local_m), fx.Index(local_n))),
+                    y_rsrc,
+                    y_offset(global_m, local_n),
+                )
 
     @flyc.jit
     def launch_conv2d_implicit_mfma(
