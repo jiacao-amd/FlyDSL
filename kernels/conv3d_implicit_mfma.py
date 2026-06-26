@@ -1,4 +1,6 @@
 import functools
+import os
+import weakref
 
 import torch
 
@@ -39,6 +41,19 @@ LDS_A_SIZE = STAGES * TILE_M * TILE_K
 LDS_B_SIZE = STAGES * TILE_N * TILE_K
 
 
+_WEIGHT_CACHE = {}
+
+
+def _prep_weight(w, k, kt, kh, kw, c):
+    key = id(w)
+    ent = _WEIGHT_CACHE.get(key)
+    if ent is not None and ent[0]() is w:
+        return ent[1]
+    wk = w.permute(0, 2, 3, 4, 1).contiguous().reshape(k, kt * kh * kw * c)
+    _WEIGHT_CACHE[key] = (weakref.ref(w), wk)
+    return wk
+
+
 def _run_compiled(exe, *args):
     cf = getattr(exe, "_cf", None)
     if cf is None:
@@ -46,6 +61,106 @@ def _run_compiled(exe, *args):
         exe._cf = cf
     else:
         cf(*args)
+
+
+TR_TILE = 64
+TR_VEC = 8  
+TR_THREADS = 256
+_TR_VPL = TR_TILE // TR_VEC  
+_TR_ITERS = (TR_TILE * TR_TILE) // (TR_VEC * TR_THREADS)  
+_TR_PAD = 8 
+_TR_LDS_S = TR_TILE + _TR_PAD
+
+
+@functools.lru_cache(maxsize=64)
+def compile_transpose_ncdhw_ndhwc(n, c, s):
+    """Transpose flat (N, C, S) -> (N, S, C) (S == T*H*W). Requires c%8==0, s%8==0."""
+    grid_s = (s + TR_TILE - 1) // TR_TILE
+    grid_c = (c + TR_TILE - 1) // TR_TILE
+    elem_ty = fx.BFloat16
+
+    @flyc.kernel(known_block_size=[TR_THREADS, 1, 1])
+    def transpose_kernel(out: fx.Tensor, inp: fx.Tensor):
+        in_rsrc = buffer_ops.create_buffer_resource(inp, max_size=True)
+        out_rsrc = buffer_ops.create_buffer_resource(out, max_size=True)
+        lds_alloc = fx.SharedAllocator(static=False)
+        lds = lds_alloc.allocate(fx.Array[elem_ty, TR_TILE * _TR_LDS_S, 16]).peek()
+
+        Vec = fx.Vector
+
+        class Vec8Ty:
+            ir_type = Vec.make_type(TR_VEC, elem_ty)
+
+        class BF16Ty:
+            ir_type = elem_ty.ir_type
+
+        tid = fx.thread_idx.x
+        s0 = fx.block_idx.x * TR_TILE
+        c0 = fx.block_idx.y * TR_TILE
+        nb = fx.block_idx.z
+        in_base = nb * c * s
+        out_base = nb * s * c
+
+        def lds_store_vec8(elem_offset, value):
+            base = fx.Int64(fx.ptrtoint(lds.ptr)) + fx.Int64(elem_offset * 2)
+            ptr = buffer_ops.create_llvm_ptr(base, address_space=3)
+            llvm.StoreOp(value, ptr, alignment=16)
+
+        def lds_load_scalar(elem_offset):
+            u8 = fx.recast_iter(fx.Uint8, lds.ptr)
+            return fx.ptr_load(u8 + fx.Int32(elem_offset * 2), result_type=BF16Ty)
+
+        # Read: coalesced vec8 along contiguous S -> LDS[c_local][s_local].
+        for i in range_constexpr(_TR_ITERS):
+            lin = tid + i * TR_THREADS
+            rc = lin // _TR_VPL
+            sv = (lin % _TR_VPL) * TR_VEC
+            cc = c0 + rc
+            ss = s0 + sv
+            valid = (cc < c) & (ss < s)
+            g = arith.index_cast(T.i32, in_base + cc * s + ss)
+            safe = arith.select(valid, g, arith.constant(0, type=T.i32))
+            v = buffer_ops.buffer_load(in_rsrc, safe, vec_width=TR_VEC, dtype=elem_ty)
+            lds_store_vec8(rc * _TR_LDS_S + sv, v)
+
+        llvm.InlineAsmOp(None, [], "s_waitcnt lgkmcnt(0)\n\ts_barrier", "", has_side_effects=True)
+
+        for i in range_constexpr(_TR_ITERS):
+            lin = tid + i * TR_THREADS
+            rs = lin // _TR_VPL
+            cv = (lin % _TR_VPL) * TR_VEC
+            ss = s0 + rs
+            cc = c0 + cv
+            scalars = [lds_load_scalar((cv + j) * _TR_LDS_S + rs) for j in range_constexpr(TR_VEC)]
+            vv = Vec.from_elements(scalars, dtype=elem_ty)
+            valid = arith.andi(ss < s, cc < c)
+            store_if = scf.IfOp(valid, results_=[], has_else=False)
+            with ir.InsertionPoint(store_if.then_block):
+                go = arith.index_cast(T.i32, out_base + ss * c + cc)
+                buffer_ops.buffer_store(vv, out_rsrc, go)
+                scf.YieldOp([])
+
+    @flyc.jit
+    def launch_transpose(out: fx.Tensor, inp: fx.Tensor, stream: fx.Stream = fx.Stream(None)):
+        transpose_kernel(out, inp).launch(
+            grid=(grid_s, grid_c, n),
+            block=(TR_THREADS, 1, 1),
+            stream=stream,
+        )
+
+    return launch_transpose
+
+
+def _ncdhw_to_ndhwc(x, stream):
+    """Fast NCDHW->NDHWC via the tiled transpose kernel; falls back to torch."""
+    n, c, t, h, w = x.shape
+    s = t * h * w
+    if not (x.is_contiguous() and x.dtype == torch.bfloat16 and c % 8 == 0 and s % 8 == 0):
+        return x.permute(0, 2, 3, 4, 1).contiguous()
+    out = torch.empty((n, t, h, w, c), device=x.device, dtype=x.dtype)
+    exe = compile_transpose_ncdhw_ndhwc(n, c, s)
+    _run_compiled(exe, out, x, torch.cuda.current_stream() if stream is None else stream)
+    return out
 
 
 @functools.lru_cache(maxsize=64)
@@ -69,6 +184,7 @@ def compile_conv3d_implicit_mfma(
     pad_w_lo,
     pad_w_hi,
     has_bias=False,
+    splitk=1,
 ):
     to = (t + pad_t_lo + pad_t_hi - kt) // st + 1
     ho = (h + pad_h_lo + pad_h_hi - kh) // sh + 1
@@ -77,6 +193,19 @@ def compile_conv3d_implicit_mfma(
     thw = to * hw
     m_total = n * thw
     crs = c * kt * kh * kw
+
+    _forced_n = os.environ.get("CONV3D_TILE_N")
+    _wide_n = m_total >= 50000 or (hw >= 16384 and k >= 256)
+    if _forced_n:
+        TILE_N = int(_forced_n)
+    elif _wide_n:
+        TILE_N = min((128, 192), key=lambda tn: ((k + tn - 1) // tn, tn))
+    else:
+        TILE_N = 64
+    WARP_N = TILE_N // BLOCK_N_WARPS
+    WARP_N_STEPS = WARP_N // MFMA_N
+    LDG_B_COUNT = TILE_N * TILE_K // BLOCK_VECS
+    LDS_B_SIZE = STAGES * TILE_N * TILE_K
 
     a_vec = 1
     for v in (8, 4, 2):
@@ -90,6 +219,13 @@ def compile_conv3d_implicit_mfma(
     grid_m = (m_total + TILE_M - 1) // TILE_M
     grid_n = (k + TILE_N - 1) // TILE_N
     k_tiles = (crs + TILE_K - 1) // TILE_K
+
+    splitk = max(1, min(splitk, k_tiles))
+    tiles_per_split = (k_tiles + splitk - 1) // splitk
+    use_splitk = splitk > 1
+    mask_k = k_tail or use_splitk
+    bias_in_kernel = has_bias and not use_splitk
+    out_ty = fx.Float32 if use_splitk else fx.BFloat16
 
     elem_ty = fx.BFloat16
     mfma_fn = rocdl.mfma_f32_16x16x32_bf16
@@ -110,6 +246,11 @@ def compile_conv3d_implicit_mfma(
         pid_n = fx.block_idx.y
         m_offset = pid_m * TILE_M
         n_offset = pid_n * TILE_N
+        # First k-tile this split-K block reduces (k_off==0 when splitk==1).
+        if const_expr(use_splitk):
+            k_off = fx.block_idx.z * (tiles_per_split * TILE_K)
+        else:
+            k_off = 0
 
         wid = tid // WARP_SIZE
         lane = tid % WARP_SIZE
@@ -194,8 +335,9 @@ def compile_conv3d_implicit_mfma(
                 in_w = ow * sw + kw_i - pad_w_lo
 
                 valid = row_valid & in_range(in_t, t) & in_range(in_h, h) & in_range(in_w, w)
-                if const_expr(k_tail):
-                    # zero the A tail so the (possibly garbage) B tail multiplies out
+                if const_expr(mask_k):
+                    # zero the A tail / split-K overhang so the (possibly garbage)
+                    # B tail multiplies out
                     valid = valid & (k_abs < crs)
 
                 g_off = (((n_idx * t + in_t) * h + in_h) * w + in_w) * c + cc
@@ -248,20 +390,20 @@ def compile_conv3d_implicit_mfma(
                         )
             return new_accs
 
-        # Prologue: stage 0 holds k-tile 0.
-        commit_a(0, gather_a(0))
-        commit_b(0, gather_b(0))
+        # Prologue: stage 0 holds this block's first k-tile (k_off).
+        commit_a(0, gather_a(k_off))
+        commit_b(0, gather_b(k_off))
         barrier(lgkmcnt=0)
 
         stage = 0
-        for kt_idx in range_constexpr(k_tiles):
-            if const_expr(kt_idx + 1 < k_tiles):
-                next_a = gather_a((kt_idx + 1) * TILE_K)
-                next_b = gather_b((kt_idx + 1) * TILE_K)
+        for kt_idx in range_constexpr(tiles_per_split):
+            if const_expr(kt_idx + 1 < tiles_per_split):
+                next_a = gather_a(k_off + (kt_idx + 1) * TILE_K)
+                next_b = gather_b(k_off + (kt_idx + 1) * TILE_K)
             rocdl.s_setprio(1)
             accs = compute_stage(stage, accs)
             rocdl.s_setprio(0)
-            if const_expr(kt_idx + 1 < k_tiles):
+            if const_expr(kt_idx + 1 < tiles_per_split):
                 n_stage = (stage + 1) % STAGES
                 commit_a(n_stage, next_a)
                 commit_b(n_stage, next_b)
@@ -275,34 +417,74 @@ def compile_conv3d_implicit_mfma(
                 col = n_offset + warp_n + wn * MFMA_N + c_n
                 col_valid = col < k
                 acc = Vec(accs[wm * WARP_N_STEPS + wn])
-                if const_expr(has_bias):
+                if const_expr(bias_in_kernel):
                     bias_off = arith.select(col_valid, arith.index_cast(T.i32, col), arith.constant(0, type=T.i32))
                     bias_val = fx.Float32(buffer_ops.buffer_load(bias_rsrc, bias_off, vec_width=1, dtype=fx.Float32))
                 for i in range_constexpr(MFMA_C_VALUES):
                     row = m_offset + warp_m + wm * MFMA_M + c_m_vec + i
                     row_valid = row < m_total
-                    # scf.IfOp needs a raw i1 Value (not a Numeric), so use andi.
                     valid = arith.andi(row_valid, col_valid)
-                    if const_expr(has_bias):
-                        c_val = (acc[i] + bias_val).to(elem_ty)
-                    else:
-                        c_val = acc[i].to(elem_ty)
                     store_if = scf.IfOp(valid, results_=[], has_else=False)
                     with ir.InsertionPoint(store_if.then_block):
-                        buffer_ops.buffer_store(c_val, y_rsrc, row * k + col)
+                        if const_expr(use_splitk):
+                            off_bytes = arith.index_cast(T.i32, (row * k + col) * 4)
+                            zero_i32 = arith.constant(0, type=T.i32)
+                            rocdl.raw_ptr_buffer_atomic_fadd(acc[i], y_rsrc, off_bytes, zero_i32, zero_i32)
+                        else:
+                            if const_expr(n == 1):
+                                out_off = col * thw + row
+                            else:
+                                out_off = (row // thw) * (k * thw) + col * thw + (row % thw)
+                            if const_expr(bias_in_kernel):
+                                buffer_ops.buffer_store((acc[i] + bias_val).to(out_ty), y_rsrc, out_off)
+                            else:
+                                buffer_ops.buffer_store(acc[i].to(out_ty), y_rsrc, out_off)
                         scf.YieldOp([])
 
     @flyc.jit
     def launch_conv3d_implicit_mfma(
-        y: fx.Tensor, x: fx.Tensor, weight: fx.Tensor, bias: fx.Tensor, stream: fx.Stream = fx.Stream(None)
+        y: fx.Tensor, x: fx.Tensor, w: fx.Tensor, bias: fx.Tensor, stream: fx.Stream = fx.Stream(None)
     ):
-        conv3d_implicit_mfma_kernel(y, x, weight, bias).launch(
-            grid=(grid_m, grid_n, 1),
+        conv3d_implicit_mfma_kernel(y, x, w, bias).launch(
+            grid=(grid_m, grid_n, splitk),
             block=(BLOCK_THREADS, 1, 1),
             stream=stream,
         )
 
     return launch_conv3d_implicit_mfma
+
+
+def _choose_splitk(m_total, k, crs, device):
+    """Pick a split-K factor for block-starved shapes (small M, large K).
+
+    Returns 1 (no split-K) once the base grid already fills a wave of CUs;
+    otherwise aims for ~4 waves of blocks (capped at 4). ``CONV3D_SPLITK`` env
+    var forces a fixed value (for benchmarking / autotuning).
+    """
+    forced = os.environ.get("CONV3D_SPLITK")
+    if forced is not None:
+        return max(1, int(forced))
+
+    grid_m = (m_total + TILE_M - 1) // TILE_M
+    grid_n = (k + TILE_N - 1) // TILE_N
+    base = grid_m * grid_n
+    k_tiles = (crs + TILE_K - 1) // TILE_K
+    if base <= 0:
+        return 1
+    try:
+        num_cu = torch.cuda.get_device_properties(device).multi_processor_count
+    except Exception:
+        num_cu = 256
+    # Only split when the base grid does not even fill one wave of CUs; otherwise
+    # the atomic-reduction overhead outweighs the occupancy gain.
+    if base >= num_cu:
+        return 1
+    # Aim for ~4 waves of blocks; cap at 4 (returns diminish past that), and
+    # prefer a divisor of k_tiles so the last split has no wasted overhang tiles.
+    sk = min(4, max(1, (4 * num_cu) // base), k_tiles)
+    while sk > 1 and k_tiles % sk != 0:
+        sk -= 1
+    return max(1, sk)
 
 
 def _normalize_3(v):
@@ -370,10 +552,17 @@ def _conv3d_padded(x, w, bias, strides, pads, stream):
     else:
         bias_arg = torch.empty(1, device=x.device, dtype=torch.float32)
 
-    x_ndhwc = x.permute(0, 2, 3, 4, 1).contiguous()
-    # w (K, C, kt, kh, kw) -> (K, kt, kh, kw, C) -> (K, kt*kh*kw*C)
-    w_kthwc = w.permute(0, 2, 3, 4, 1).contiguous().reshape(k, kt * kh * kw * c)
-    y = torch.empty((n * to * ho * wo, k), device=x.device, dtype=x.dtype)
+    x_ndhwc = _ncdhw_to_ndhwc(x, stream)
+    # w (K, C, kt, kh, kw) -> (K, kt, kh, kw, C) -> (K, kt*kh*kw*C); cached per weight.
+    w_kthwc = _prep_weight(w, k, kt, kh, kw, c)
+
+    m_total = n * to * ho * wo
+    crs = c * kt * kh * kw
+    splitk = _choose_splitk(m_total, k, crs, x.device)
+    if splitk > 1:
+        y = torch.zeros((m_total, k), device=x.device, dtype=torch.float32)
+    else:
+        y = torch.empty((n, k, to, ho, wo), device=x.device, dtype=x.dtype)
 
     exe = compile_conv3d_implicit_mfma(
         n,
@@ -395,7 +584,11 @@ def _conv3d_padded(x, w, bias, strides, pads, stream):
         pad_w_lo,
         pad_w_hi,
         bias is not None,
+        splitk,
     )
     _run_compiled(exe, y, x_ndhwc, w_kthwc, bias_arg, torch.cuda.current_stream() if stream is None else stream)
-    # (N*To*Ho*Wo, K) -> (N, To, Ho, Wo, K) -> (N, K, To, Ho, Wo)
-    return y.view(n, to, ho, wo, k).permute(0, 4, 1, 2, 3)
+    if splitk > 1:
+        if bias is not None:
+            y = y + bias_f32.view(1, k)
+        return y.to(x.dtype).view(n, to, ho, wo, k).permute(0, 4, 1, 2, 3)
+    return y
