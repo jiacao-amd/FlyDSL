@@ -32,17 +32,12 @@ WARP_N_STEPS = WARP_N // MFMA_N
 WARP_K_STEPS = TILE_K // MFMA_K
 
 LDG_VEC = 8
-DMA_BYTES = 16
 BLOCK_VECS = LDG_VEC * BLOCK_THREADS
 LDG_A_COUNT = TILE_M * TILE_K // BLOCK_VECS
 LDG_B_COUNT = TILE_N * TILE_K // BLOCK_VECS
 LDG_C_COUNT = TILE_M * TILE_N // BLOCK_VECS
 LDS_A_SIZE = STAGES * TILE_M * TILE_K
 LDS_B_SIZE = STAGES * TILE_N * TILE_K
-
-
-def swizzle_xor16(row, col_in_bytes):
-    return col_in_bytes ^ ((row % (TILE_K * 2 // 16)) * 16)
 
 
 def _run_compiled(exe, *args):
@@ -107,30 +102,20 @@ def compile_conv2d_implicit_mfma(n, c, h, width, k, r, s, has_bias=False):
         class Vec8Ty:
             ir_type = Vec.make_type(8, elem_ty)
 
+        zero8 = arith.constant_vector(0.0, Vec8Ty.ir_type)
+
         def barrier(vmcnt=0, lgkmcnt=None):
             wait = f"s_waitcnt vmcnt({vmcnt})"
             if lgkmcnt is not None:
                 wait += f" lgkmcnt({lgkmcnt})"
             llvm.InlineAsmOp(None, [], f"{wait}\n\ts_barrier", "", has_side_effects=True)
 
-        def dma_warp_offset():
-            return rocdl.readfirstlane(
-                T.i64,
-                arith.index_cast(T.i64, fx.Index(wid) * arith.constant(WARP_SIZE * DMA_BYTES, index=True)),
-            )
-
-        def buffer_load_to_lds(rsrc, lds_ptr, global_offset):
-            llvm.InlineAsmOp(
-                None,
-                [lds_ptr, global_offset, rsrc],
-                "s_mov_b32 m0, $0\n\tbuffer_load_dwordx4 $1, $2, 0 offen sc0 lds",
-                "s,v,s",
-                has_side_effects=True,
-            )
-
         def lds_ptr_at(lds_array, byte_offset):
             lds_base = fx.Int64(fx.ptrtoint(lds_array.ptr)) + fx.Int64(byte_offset)
             return buffer_ops.create_llvm_ptr(lds_base, address_space=3)
+
+        def lds_store_vec8(lds_array, elem_offset, value):
+            llvm.StoreOp(value, lds_ptr_at(lds_array, elem_offset * 2), alignment=16)
 
         def lds_load_vec8(lds_array, elem_offset):
             u8_ptr = fx.recast_iter(fx.Uint8, lds_array.ptr)
@@ -155,7 +140,6 @@ def compile_conv2d_implicit_mfma(n, c, h, width, k, r, s, has_bias=False):
             return row * k + col
 
         def load_a_to_lds(k_base, stage):
-            warp_lds_off = dma_warp_offset()
             for i in range_constexpr(LDG_A_COUNT):
                 linear = tid * LDG_VEC + i * BLOCK_VECS
                 local_m = linear // TILE_K
@@ -165,47 +149,32 @@ def compile_conv2d_implicit_mfma(n, c, h, width, k, r, s, has_bias=False):
                 pq = row % (p * q)
                 pp = pq // q
                 qq = pq % q
-                col_bytes = swizzle_xor16(local_m, local_k * 2)
-                k_abs = fx.Index(k_base) + fx.Index(col_bytes // 2)
+                k_abs = fx.Index(k_base) + fx.Index(local_k)
                 rs = k_abs // c
                 rr = rs // s
                 ss = rs % s
                 cc = k_abs % c
 
-                g_off = x_offset(n_idx, pp + rr, qq + ss, cc) * 2
-                g_off = arith.index_cast(T.i32, g_off)
-
-                if const_expr(i == 0):
-                    lds_off = a_lds_offset(stage, fx.Index(0), fx.Index(0)) * 2
-                    lds_ptr_base = lds_ptr_at(a_lds, lds_off)
-                    lds_ptr = buffer_ops.get_element_ptr(lds_ptr_base, warp_lds_off)
-                else:
-                    lds_ptr = buffer_ops.get_element_ptr(lds_ptr, static_byte_offset=BLOCK_THREADS * DMA_BYTES)
-
+                g_off = arith.index_cast(T.i32, x_offset(n_idx, pp + rr, qq + ss, cc))
+                lds_off = a_lds_offset(stage, local_m, local_k)
                 if const_expr(npq % TILE_M == 0):
-                    buffer_load_to_lds(x_rsrc, lds_ptr, g_off)
-                elif row < fx.Index(npq):
-                    buffer_load_to_lds(x_rsrc, lds_ptr, g_off)
+                    v = buffer_ops.buffer_load(x_rsrc, g_off, vec_width=8, dtype=elem_ty)
+                else:
+                    valid = row < fx.Index(npq)
+                    safe = arith.select(valid, g_off, arith.constant(0, type=T.i32))
+                    raw = buffer_ops.buffer_load(x_rsrc, safe, vec_width=8, dtype=elem_ty)
+                    v = arith.select(valid, raw, zero8)
+                lds_store_vec8(a_lds, lds_off, v)
 
         def load_b_to_lds(k_base, stage):
-            warp_lds_off = dma_warp_offset()
             for i in range_constexpr(LDG_B_COUNT):
                 linear = tid * LDG_VEC + i * BLOCK_VECS
                 local_n = linear // TILE_K
                 local_k = linear % TILE_K
-                col_bytes = swizzle_xor16(local_n, local_k * 2)
 
-                g_off = w_offset(fx.Index(local_n), fx.Index(k_base) + fx.Index(col_bytes // 2)) * 2
-                g_off = arith.index_cast(T.i32, g_off)
-
-                if const_expr(i == 0):
-                    lds_off = b_lds_offset(stage, fx.Index(0), fx.Index(0)) * 2
-                    lds_ptr_base = lds_ptr_at(b_lds, lds_off)
-                    lds_ptr = buffer_ops.get_element_ptr(lds_ptr_base, warp_lds_off)
-                else:
-                    lds_ptr = buffer_ops.get_element_ptr(lds_ptr, static_byte_offset=BLOCK_THREADS * DMA_BYTES)
-
-                buffer_load_to_lds(w_rsrc, lds_ptr, g_off)
+                g_off = arith.index_cast(T.i32, w_offset(fx.Index(local_n), fx.Index(k_base) + fx.Index(local_k)))
+                v = buffer_ops.buffer_load(w_rsrc, g_off, vec_width=8, dtype=elem_ty)
+                lds_store_vec8(b_lds, b_lds_offset(stage, local_n, local_k), v)
 
         def compute_stage(stage, old_accs):
             new_accs = [a for a in old_accs]
@@ -213,11 +182,11 @@ def compile_conv2d_implicit_mfma(n, c, h, width, k, r, s, has_bias=False):
                 k_inner = kk * MFMA_K
                 for wm in range_constexpr(WARP_M_STEPS):
                     a_row = warp_m + wm * MFMA_M + lane_m
-                    a_col = swizzle_xor16(a_row, (k_inner + lane_k_a) * 2) // 2
+                    a_col = k_inner + lane_k_a
                     a_frag = lds_load_vec8(a_lds, a_lds_offset(stage, fx.Index(a_row), fx.Index(a_col)))
                     for wn in range_constexpr(WARP_N_STEPS):
                         b_row = warp_n + wn * MFMA_N + lane_n
-                        b_col = swizzle_xor16(b_row, (k_inner + lane_k_b) * 2) // 2
+                        b_col = k_inner + lane_k_b
                         b_frag = lds_load_vec8(b_lds, b_lds_offset(stage, fx.Index(b_row), fx.Index(b_col)))
                         idx = wm * WARP_N_STEPS + wn
                         new_accs[idx] = mfma_fn(
@@ -230,13 +199,13 @@ def compile_conv2d_implicit_mfma(n, c, h, width, k, r, s, has_bias=False):
             preload_k = preload * TILE_K
             load_b_to_lds(preload_k, preload)
             load_a_to_lds(preload_k, preload)
-        barrier()
+        barrier(lgkmcnt=0)
 
         stage = 0
         for kt in range_constexpr(k_tiles - (STAGES - 1)):
             write_stage = (stage + STAGES - 1) % STAGES
             next_k = (kt + STAGES - 1) * TILE_K
-            barrier()
+            barrier(lgkmcnt=0)
             load_b_to_lds(next_k, write_stage)
             load_a_to_lds(next_k, write_stage)
             rocdl.s_setprio(1)
@@ -245,13 +214,13 @@ def compile_conv2d_implicit_mfma(n, c, h, width, k, r, s, has_bias=False):
             stage = (stage + 1) % STAGES
 
         for tail in range_constexpr(STAGES - 1):
-            barrier()
+            barrier(lgkmcnt=0)
             rocdl.s_setprio(1)
             accs = compute_stage(stage, accs)
             rocdl.s_setprio(0)
             stage = (stage + 1) % STAGES
 
-        barrier()
+        barrier(lgkmcnt=0)
 
         c_m_vec = lane // MFMA_N * MFMA_C_VALUES
         c_n = lane % MFMA_N
@@ -330,9 +299,9 @@ def conv2d_implicit_mfma(x: torch.Tensor, w: torch.Tensor, bias=None, stream=Non
     n, c, h, width = x.shape
     k, wc, r, s = w.shape
     assert c == wc, f"in-channel mismatch: x has {c}, w has {wc}"
-    assert x.dtype == torch.bfloat16 and w.dtype == torch.bfloat16, (
-        f"only bfloat16 supported, got x={x.dtype}, w={w.dtype}"
-    )
+    assert (
+        x.dtype == torch.bfloat16 and w.dtype == torch.bfloat16
+    ), f"only bfloat16 supported, got x={x.dtype}, w={w.dtype}"
     p = h - r + 1
     q = width - s + 1
 

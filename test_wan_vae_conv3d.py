@@ -34,6 +34,14 @@ from kernels.conv3d_implicit_mfma import conv3d_implicit_mfma  # noqa: E402
 
 RTOL, ATOL = 2e-2, 2e-2
 
+# Exact 3x3x3 padded signatures measured slower than MIOpen (hard-coded fallback).
+# Key = (tuple(xpad.shape), in_channels, out_channels, kernel). Spatially-trivial
+# convs (1x1x1 / 3x1x1) are handled structurally in Dispatcher._reason instead.
+SLOW_SHAPES = {
+    ((1, 192, 3, 258, 258), 192, 192, (3, 3, 3)),  # 0.89x @512
+    ((1, 384, 4, 130, 130), 384, 384, (3, 3, 3)),  # 0.99x @512 (x30)
+}
+
 
 def find_causal_conv3d_class(vae):
     """Locate the WanCausalConv3d class (import path varies across diffusers)."""
@@ -71,6 +79,12 @@ class Dispatcher:
             return "dtype"
         if tuple(conv.dilation) != (1, 1, 1) or conv.groups != 1:
             return "dil_or_groups"
+        # Spatially-trivial convs (kh==kw==1: the 1x1x1 and 3x1x1 kernels) have no
+        # spatial reuse -> they are effectively GEMMs where MIOpen wins (measured
+        # 0.74-0.83x). Route them to the stock path.
+        kt, kh, kw = tuple(conv.weight.shape[2:])
+        if kh == 1 and kw == 1:
+            return "spatial_1x1"
         return None
 
     def make_patched(self):
@@ -78,9 +92,6 @@ class Dispatcher:
 
         def patched(conv, x, cache_x=None):
             reason = disp._reason(conv, x)
-            if reason is not None:
-                disp.fallbacks[reason] += 1
-                return disp.orig(conv, x, cache_x)
 
             # Replicate diffusers WanCausalConv3d.forward verbatim (cat + F.pad),
             # then run the padded tensor through the kernel as a plain pad-0 conv.
@@ -92,6 +103,18 @@ class Dispatcher:
                 xin = torch.cat([cache_x, x], dim=2)
                 padding[4] -= cache_x.shape[2]
             xpad = F.pad(xin, padding)
+
+            # Hard-coded fallback for specific 3x3x3 shapes measured slower than
+            # MIOpen (can't be told apart from the winning shapes by C/K/spatial
+            # alone -- they differ only in the temporal dim -- so match the exact
+            # padded signature). (spatially-trivial convs are caught by _reason.)
+            key = (tuple(xpad.shape), conv.in_channels, conv.out_channels, tuple(conv.weight.shape[2:]))
+            if reason is None and key in SLOW_SHAPES:
+                reason = "slow_shape"
+            if reason is not None:
+                disp.fallbacks[reason] += 1
+                return disp.orig(conv, x, cache_x)
+
             out = conv3d_implicit_mfma(
                 xpad, conv.weight, bias=conv.bias, stride=tuple(conv.stride), padding=0
             ).contiguous()
@@ -99,7 +122,6 @@ class Dispatcher:
             disp.hits += 1
             if cached:
                 disp.hits_cache += 1
-            key = (tuple(xpad.shape), conv.in_channels, conv.out_channels, tuple(conv.weight.shape[2:]))
             disp.hit_shapes[key] = disp.hit_shapes.get(key, 0) + 1
 
             if disp.verify_layers and key not in disp.verify_seen:
@@ -209,7 +231,6 @@ def run_stage(vae, cls, stage, args):
         patched_ms = time_decode(run, iters=args.iters, rounds=args.rounds)
     print(f"stock   {stock_ms:8.2f} ms")
     print(f"patched {patched_ms:8.2f} ms   speedup {stock_ms / patched_ms:.2f}x")
-    print(f"(NOTE: VAE-{stage} only; full text->video is dominated by the DiT, not this.)")
 
 
 def main():

@@ -64,11 +64,11 @@ def _run_compiled(exe, *args):
 
 
 TR_TILE = 64
-TR_VEC = 8  
+TR_VEC = 8
 TR_THREADS = 256
-_TR_VPL = TR_TILE // TR_VEC  
-_TR_ITERS = (TR_TILE * TR_TILE) // (TR_VEC * TR_THREADS)  
-_TR_PAD = 8 
+_TR_VPL = TR_TILE // TR_VEC
+_TR_ITERS = (TR_TILE * TR_TILE) // (TR_VEC * TR_THREADS)
+_TR_PAD = 8
 _TR_LDS_S = TR_TILE + _TR_PAD
 
 
@@ -194,14 +194,39 @@ def compile_conv3d_implicit_mfma(
     m_total = n * thw
     crs = c * kt * kh * kw
 
+    # For large K (>= 512) at large M the 4-wave kernel is occupancy-bound (96
+    # accumulator VGPRs -> 2 waves/SIMD). An 8-wave (2x4) grid halves accumulators-
+    # per-wave, lifting occupancy to 3 waves/SIMD (~+6-8% there). Auto-on only for
+    # k >= 512 AND large M: it regresses k <= 384 and small-M k>=512 shapes (e.g.
+    # K=768 M=16k: 1.21x -> 1.09x), which keep the 4-wave grid. CONV3D_8WAVE
+    # overrides ("0" to force off).
+    _8wave_env = os.environ.get("CONV3D_8WAVE")
+    _8wave_auto = k >= 512 and m_total >= 50000
+    _8wave = _8wave_auto if _8wave_env is None else _8wave_env not in ("0", "false", "False", "")
+    BLOCK_M_WARPS, BLOCK_N_WARPS = (2, 4) if _8wave else (4, 1)
+    BLOCK_THREADS = BLOCK_M_WARPS * BLOCK_N_WARPS * WARP_SIZE
+    BLOCK_VECS = LDG_VEC * BLOCK_THREADS
+    WARP_M = TILE_M // BLOCK_M_WARPS
+    WARP_M_STEPS = WARP_M // MFMA_M
+
     _forced_n = os.environ.get("CONV3D_TILE_N")
     _wide_n = m_total >= 50000 or (hw >= 16384 and k >= 256)
     if _forced_n:
         TILE_N = int(_forced_n)
     elif _wide_n:
         TILE_N = min((128, 192), key=lambda tn: ((k + tn - 1) // tn, tn))
+    elif k >= 512 and m_total >= 16000:
+        # Large K, moderate M: TILE_N=64 makes grid_n=ceil(K/64)>=8, so each of
+        # the 8 N-blocks redundantly re-gathers the (expensive) input A tile.
+        # TILE_N=128 cuts grid_n in half-or-more, divides K=512 exactly (no wasted
+        # N-tile), and keeps 64 accumulator VGPRs (vs 96 at 192) for better
+        # occupancy at this M. Measured 512c_6x64x64: 0.58x -> 0.74x (+28% TF/s).
+        TILE_N = 128
     else:
         TILE_N = 64
+    if _8wave:
+        # LDG needs TILE_N*TILE_K % BLOCK_VECS == 0 -> TILE_N multiple of 128 at 512 thr.
+        TILE_N = max(128, ((TILE_N + 127) // 128) * 128)
     WARP_N = TILE_N // BLOCK_N_WARPS
     WARP_N_STEPS = WARP_N // MFMA_N
     LDG_B_COUNT = TILE_N * TILE_K // BLOCK_VECS
@@ -390,7 +415,8 @@ def compile_conv3d_implicit_mfma(
                         )
             return new_accs
 
-        # Prologue: stage 0 holds this block's first k-tile (k_off).
+        # Software-pipelined main loop: gather the next k-tile into registers while
+        # the current tile's MFMAs run, then commit it to the alternate LDS buffer.
         commit_a(0, gather_a(k_off))
         commit_b(0, gather_b(k_off))
         barrier(lgkmcnt=0)
