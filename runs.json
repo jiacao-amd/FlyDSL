@@ -1,6 +1,6 @@
 {
  "schema": 1,
- "updated": "2026-08-05T16:54:50Z",
+ "updated": "2026-08-05T17:06:17Z",
  "repo": "jiacao-amd/FlyDSL",
  "runs": [
   {
@@ -10,11 +10,11 @@
    "branch": "main",
    "event": "push",
    "title": "[Prune] Remove CDNA blockscale FP8 GEMM (#966)",
-   "status": "queued",
-   "conclusion": null,
+   "status": "completed",
+   "conclusion": "cancelled",
    "url": "https://github.com/jiacao-amd/FlyDSL/actions/runs/30932265799",
    "created_at": "2026-08-04T17:05:24Z",
-   "updated_at": "2026-08-04T17:06:05Z",
+   "updated_at": "2026-08-05T17:06:07Z",
    "actor": "jiacao-amd",
    "jobs": []
   },
