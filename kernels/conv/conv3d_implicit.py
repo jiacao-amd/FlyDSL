@@ -17,6 +17,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
+from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import arith, const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from kernels.common import buffer_ops
@@ -37,6 +38,36 @@ LDG_VEC = 8
 BF16_BYTES = 2
 
 DEFAULT_TILE = (128, 128, 2, 4)
+
+# Applied around both tracing and flyc.compile so the hinted and the fast-dispatch
+# paths lower identically. Keys are the ones rocm.py reads: waves_per_eu, maxnreg,
+# fast_fp_math, unsafe_fp_math, llvm_options.
+#
+# Deliberately empty. Swept on gfx950 over five shapes (g in {1,2,4,8}, small and
+# large): fast_fp_math is a wash -- MFMA does the arithmetic and the epilogue is a
+# single f32->bf16 convert, so there is nothing to reassociate -- and waves_per_eu
+# of 1/2 measured 3%/11% slower, 4 within noise. Left as the hook the launchers
+# already thread through, not as a tuning knob that currently pays.
+CONV_COMPILE_HINTS = {}
+
+
+def _as_stream(stream):
+    return stream if hasattr(stream, "_is_stream_param") else fx.Stream(stream)
+
+
+def _dispatch(exe, *args, stream=None):
+    """Run a builder's launcher, pre-compiling on first use.
+
+    ``exe.compile(...)`` both compiles and executes, and hands back a
+    ``CompiledFunction`` whose call path skips signature binding and cache lookup
+    (~5 us vs ~35 us for the @flyc.jit wrapper). Cached on the launcher, which is
+    itself memoized per problem shape by the builder's lru_cache.
+    """
+    cf = getattr(exe, "_cf", None)
+    if cf is None:
+        exe._cf = exe.compile(*args, stream=stream)
+        return
+    cf(*args, _as_stream(stream))
 
 
 def _autotune_enabled():
@@ -156,7 +187,16 @@ def compile_transpose_ncdhw_ndhwc(n, c, s):
             stream=stream,
         )
 
-    return launch_transpose
+    def _launch(out, inp, stream=None):
+        with CompilationContext.compile_hints(CONV_COMPILE_HINTS):
+            return launch_transpose(out, inp, stream=_as_stream(stream))
+
+    def _compile(out, inp, stream=None):
+        with CompilationContext.compile_hints(CONV_COMPILE_HINTS):
+            return flyc.compile(launch_transpose, out, inp, _as_stream(stream))
+
+    _launch.compile = _compile
+    return _launch
 
 
 def _ncdhw_to_ndhwc(x, stream):
@@ -167,7 +207,7 @@ def _ncdhw_to_ndhwc(x, stream):
         return x.permute(0, 2, 3, 4, 1).contiguous()
     out = torch.empty((n, t, h, w, c), device=x.device, dtype=x.dtype)
     exe = compile_transpose_ncdhw_ndhwc(n, c, s)
-    exe(out, x, torch.cuda.current_stream() if stream is None else stream)
+    _dispatch(exe, out, x, stream=torch.cuda.current_stream() if stream is None else stream)
     return out
 
 
@@ -683,7 +723,16 @@ def compile_conv3d_implicit(
             grid=(grid_m, grid_n, splitk), block=(BLOCK_THREADS, 1, 1), stream=stream
         )
 
-    return launch
+    def _launch(y, x, weight, bias, stream=None):
+        with CompilationContext.compile_hints(CONV_COMPILE_HINTS):
+            return launch(y, x, weight, bias, stream=_as_stream(stream))
+
+    def _compile(y, x, weight, bias, stream=None):
+        with CompilationContext.compile_hints(CONV_COMPILE_HINTS):
+            return flyc.compile(launch, y, x, weight, bias, _as_stream(stream))
+
+    _launch.compile = _compile
+    return _launch
 
 
 def _resolve_splitk(splitk, npq, crs, k, device, tile=DEFAULT_TILE, groups=1):
@@ -788,7 +837,7 @@ def _conv3d_impl(
         exe = compile_conv3d_implicit(
             n, c, d, h, w, k, kt, kh, kw, st, sh, sw, pt, ph, pw, has_bias, sk, the_tile, the_wgm, groups
         )
-        exe(y, x_ndhwc, w_packed, bias_arg, launch_stream)
+        _dispatch(exe, y, x_ndhwc, w_packed, bias_arg, stream=launch_stream)
         return y, sk
 
     if tile is not None:
@@ -850,12 +899,13 @@ def conv3d_implicit(x, weight, bias=None, stride=1, padding=0, **kwargs):
 
     ``groups`` follows torch semantics: C and K must both be divisible by it and the
     weight's channel dim is C/groups. Groups map onto the N grid axis, one tile never
-    spanning two groups, so efficiency tracks how well K/groups fills TILE_N. K/groups
-    >= 128 runs at ungrouped speed; below the narrowest tile (TILE_N=64) the N tile
-    under-fills proportionally. Depthwise (groups == C) is correct but slow: C/groups=1
-    also pads to the gather's 8-wide vector, so 7/8 of the K axis is zeros. High
-    cardinality (e.g. ResNeXt 32x4d, K/groups=4) is correct but not competitive with
-    MIOpen -- that is inherent to the single-GEMM mapping, not a bug.
+    spanning two groups, so efficiency tracks how well K/groups fills TILE_N. Measured
+    on gfx950 vs torch/MIOpen, moderate cardinality wins across the board (1.5-2.0x for
+    K/groups in [8, 256]). True depthwise (groups == C, so C/groups == 1) is the one
+    weak case at ~0.5x: C/groups=1 pads to the gather's 8-wide vector, wasting 7/8 of
+    the K axis, while K/groups=1 leaves all but one column of the N tile masked.
+    Narrower tiles recover little there -- depthwise wants its own kernel, not this
+    single-GEMM mapping.
     """
     assert x.dim() == weight.dim(), f"x rank {x.dim()} != weight rank {weight.dim()}"
     spatial_rank = weight.dim() - 2
