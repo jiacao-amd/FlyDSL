@@ -7,7 +7,7 @@
 
 Compares ``conv3d_implicit`` against ``torch.nn.functional.conv3d`` on
 NCDHW/OIDHW bf16 inputs across stride/padding and M%TILE_M / K%TILE_N tail paths.
-Any channel count and spatial extent is supported.
+Any channel count, spatial extent, and group count is supported.
 """
 
 import pytest
@@ -254,3 +254,116 @@ def test_conv1d_vs_torch(s, stride, padding):
 
     assert y.shape == y_ref.shape
     assert torch.allclose(y, y_ref, rtol=2e-2, atol=2e-2)
+
+
+# Grouped conv. Groups fold onto the N grid axis, one tile never spanning two groups, so
+# these cover the per-group channel pad (C/groups % 8 != 0) and the per-group N tail
+# (K/groups % TILE_N != 0) as well as the plain aligned case.
+@_skip_non_cdna4
+@pytest.mark.parametrize(
+    "n,c,t,h,w,k,groups,stride,padding",
+    [
+        (1, 64, 6, 16, 16, 128, 2, 1, 1),  # CG=32, KG=64, both aligned
+        (2, 128, 4, 14, 14, 256, 4, 1, 1),  # CG=32, KG=64
+        (1, 256, 4, 12, 12, 128, 8, 1, 0),  # CG=32, KG=16 -> N tile under-fills
+        (1, 64, 8, 20, 20, 64, 2, 2, 1),  # strided
+        (1, 32, 4, 12, 12, 96, 4, 1, 1),  # CG=8 exactly at the vector width
+        (1, 12, 4, 12, 12, 32, 4, 1, 1),  # CG=3 -> per-group pad to 8
+        (1, 24, 4, 10, 10, 40, 8, 1, 1),  # CG=3, KG=5 -> pad + tail together
+        (1, 96, 4, 10, 10, 48, 3, 1, 1),  # CG=32, KG=16, groups not a power of two
+        (1, 40, 3, 9, 9, 20, 5, 1, 1),  # CG=8, KG=4
+        (1, 16, 4, 8, 8, 16, 16, 1, 1),  # depthwise: CG=1, KG=1
+        (1, 32, 3, 8, 8, 64, 32, 1, 1),  # depthwise with multiplier 2
+    ],
+)
+def test_conv3d_grouped_vs_torch(n, c, t, h, w, k, groups, stride, padding):
+    torch.manual_seed(9000 + c + k + groups)
+    x = torch.randn((n, c, t, h, w), device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn((k, c // groups, 3, 3, 3), device="cuda", dtype=torch.bfloat16)
+
+    y = conv3d_implicit(x, weight, stride=stride, padding=padding, groups=groups)
+    y_ref = F.conv3d(x, weight, stride=stride, padding=padding, groups=groups)
+    torch.cuda.synchronize()
+
+    assert y.shape == y_ref.shape
+    assert torch.allclose(y, y_ref, rtol=2e-2, atol=2e-2)
+
+
+# Bias is indexed by the global out-channel, so it must survive the group remap.
+@_skip_non_cdna4
+@pytest.mark.parametrize("groups", [1, 2, 4, 8])
+def test_conv3d_grouped_bias_vs_torch(groups):
+    torch.manual_seed(9100 + groups)
+    n, c, t, h, w, k = 1, 64, 5, 14, 14, 96
+    x = torch.randn((n, c, t, h, w), device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn((k, c // groups, 3, 3, 3), device="cuda", dtype=torch.bfloat16)
+    bias = torch.randn((k,), device="cuda", dtype=torch.float32)
+
+    y = conv3d_implicit(x, weight, bias=bias, padding=1, groups=groups)
+    y_ref = F.conv3d(x, weight, bias=bias.to(torch.bfloat16), padding=1, groups=groups)
+    torch.cuda.synchronize()
+
+    assert y.shape == y_ref.shape
+    assert torch.allclose(y, y_ref, rtol=2e-2, atol=2e-2)
+
+
+# Grouped 1x1x1 skips the ungrouped torch.matmul fast path and runs the kernel.
+@_skip_non_cdna4
+@pytest.mark.parametrize("groups", [2, 4])
+def test_conv3d_grouped_1x1x1_vs_torch(groups):
+    torch.manual_seed(9200 + groups)
+    n, c, t, h, w, k = 1, 128, 4, 12, 12, 128
+    x = torch.randn((n, c, t, h, w), device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn((k, c // groups, 1, 1, 1), device="cuda", dtype=torch.bfloat16)
+
+    y = conv3d_implicit(x, weight, groups=groups)
+    y_ref = F.conv3d(x, weight, groups=groups)
+    torch.cuda.synchronize()
+
+    assert y.shape == y_ref.shape
+    assert torch.allclose(y, y_ref, rtol=2e-2, atol=2e-2)
+
+
+# groups reaches _conv3d_impl through the degenerate-5D wrappers' **kwargs.
+@_skip_non_cdna4
+@pytest.mark.parametrize("groups", [2, 4, 16])
+def test_conv2d_grouped_vs_torch(groups):
+    torch.manual_seed(9300 + groups)
+    n, c, h, w, k = 2, 64, 20, 24, 128
+    x = torch.randn((n, c, h, w), device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn((k, c // groups, 3, 3), device="cuda", dtype=torch.bfloat16)
+    bias = torch.randn((k,), device="cuda", dtype=torch.float32)
+
+    y = conv3d_implicit(x, weight, bias=bias, padding=1, groups=groups)
+    y_ref = F.conv2d(x, weight, bias=bias.to(torch.bfloat16), padding=1, groups=groups)
+    torch.cuda.synchronize()
+
+    assert y.shape == y_ref.shape
+    assert torch.allclose(y, y_ref, rtol=2e-2, atol=2e-2)
+
+
+@_skip_non_cdna4
+@pytest.mark.parametrize("groups", [2, 8])
+def test_conv1d_grouped_vs_torch(groups):
+    torch.manual_seed(9400 + groups)
+    n, c, w, k = 2, 64, 96, 128
+    x = torch.randn((n, c, w), device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn((k, c // groups, 3), device="cuda", dtype=torch.bfloat16)
+
+    y = conv3d_implicit(x, weight, padding=1, groups=groups)
+    y_ref = F.conv1d(x, weight, padding=1, groups=groups)
+    torch.cuda.synchronize()
+
+    assert y.shape == y_ref.shape
+    assert torch.allclose(y, y_ref, rtol=2e-2, atol=2e-2)
+
+
+# Mismatched shapes must fail fast rather than compute something wrong.
+@_skip_non_cdna4
+def test_conv3d_grouped_invalid_shapes():
+    x = torch.randn((1, 12, 4, 8, 8), device="cuda", dtype=torch.bfloat16)
+
+    with pytest.raises(AssertionError, match="not divisible by groups"):
+        conv3d_implicit(x, torch.randn((16, 3, 3, 3, 3), device="cuda", dtype=torch.bfloat16), groups=5)
+    with pytest.raises(AssertionError, match="weight in-channels"):
+        conv3d_implicit(x, torch.randn((16, 12, 3, 3, 3), device="cuda", dtype=torch.bfloat16), groups=4)

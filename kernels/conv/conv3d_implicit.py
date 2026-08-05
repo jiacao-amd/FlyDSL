@@ -3,8 +3,8 @@
 
 """Double-buffered implicit-GEMM conv3d (BF16).
 
-x: (N, C, D, H, W) bf16 NCDHW, weight: (K, C, T, R, S) bf16 KCTRS.
-Returns (N, K, Do, Ho, Wo) bf16. Supports stride, padding, bias, and split-K.
+x: (N, C, D, H, W) bf16 NCDHW, weight: (K, C/groups, T, R, S) bf16 KCTRS.
+Returns (N, K, Do, Ho, Wo) bf16. Supports stride, padding, bias, groups, and split-K.
 """
 
 import functools
@@ -173,7 +173,26 @@ def _ncdhw_to_ndhwc(x, stream):
 
 @functools.lru_cache(maxsize=256)
 def compile_conv3d_implicit(
-    n, c, d, h, w, k, kt, kh, kw, st, sh, sw, pt, ph, pw, has_bias=False, splitk=1, tile=DEFAULT_TILE, wgm=1
+    n,
+    c,
+    d,
+    h,
+    w,
+    k,
+    kt,
+    kh,
+    kw,
+    st,
+    sh,
+    sw,
+    pt,
+    ph,
+    pw,
+    has_bias=False,
+    splitk=1,
+    tile=DEFAULT_TILE,
+    wgm=1,
+    groups=1,
 ):
     TILE_M, TILE_N, WAVE_M, WAVE_N = tile
     BLOCK_THREADS = WAVE_M * WAVE_N * WARP_SIZE
@@ -187,13 +206,21 @@ def compile_conv3d_implicit(
     LDG_A_COUNT = TILE_M * TILE_K // BLOCK_VECS
     LDG_B_COUNT = TILE_N * TILE_K // BLOCK_VECS
 
+    # `c` is the padded TOTAL channel count and stays the NDHWC row stride. CGP is the
+    # per-group channel count and is what the GEMM K axis decomposes against; the two
+    # coincide only when groups == 1.
+    CGP = c // groups
+    KG = k // groups
+
     assert TILE_K == 32
     assert TILE_M % (WAVE_M * MFMA_M) == 0, f"TILE_M={TILE_M} not divisible by WAVE_M*16"
     assert TILE_N % (WAVE_N * MFMA_N) == 0, f"TILE_N={TILE_N} not divisible by WAVE_N*16"
     assert (TILE_M * TILE_K) % BLOCK_VECS == 0, f"A tile {TILE_M}x{TILE_K} not a multiple of {BLOCK_VECS} vecs"
     assert (TILE_N * TILE_K) % BLOCK_VECS == 0, f"B tile {TILE_N}x{TILE_K} not a multiple of {BLOCK_VECS} vecs"
     assert LDG_A_COUNT >= 1 and LDG_B_COUNT >= 1
-    assert c % LDG_VEC == 0, f"c={c} must be a multiple of LDG_VEC={LDG_VEC}; use _conv3d_impl to pad"
+    assert c % groups == 0, f"c={c} not divisible by groups={groups}"
+    assert k % groups == 0, f"k={k} not divisible by groups={groups}"
+    assert CGP % LDG_VEC == 0, f"c/groups={CGP} must be a multiple of LDG_VEC={LDG_VEC}; use _conv3d_impl to pad"
     assert BLOCK_THREADS <= 1024, f"BLOCK_THREADS={BLOCK_THREADS} exceeds 1024"
 
     do = (d + 2 * pt - kt) // st + 1
@@ -202,14 +229,14 @@ def compile_conv3d_implicit(
     dhw = do * ho * wo
     hw_o = ho * wo
     npq = n * dhw
-    crs = c * kt * kh * kw
+    crs = CGP * kt * kh * kw
     k_tiles = (crs + TILE_K - 1) // TILE_K
 
     BIG_IN = (n * c * d * h * w) > 0x7FFFFFFF
     BIG_OUT = (n * k * do * ho * wo * BF16_BYTES) > 0x7FFFFFFF
 
     X_BYTES = n * c * d * h * w * BF16_BYTES
-    W_BYTES = k * c * kt * kh * kw * BF16_BYTES
+    W_BYTES = k * crs * BF16_BYTES
     OOB_SENTINEL_ELEM = 0x7FFFFF80  # *2 = 0xFFFFFF00 bytes (~4.2950 GB), just under 2^32
     OOB_SENTINEL_BYTES = OOB_SENTINEL_ELEM * BF16_BYTES
     BIG_IN_NR = 0x80000000  # 2 GB num_records for the rebased BIG_IN resource
@@ -219,8 +246,12 @@ def compile_conv3d_implicit(
     BIG_IN_NM = BIG_IN and n > 1
     X_SAMPLE_BYTES = c * d * h * w * BF16_BYTES
 
-    n_tail = k % TILE_N != 0
-    grid_n = (k + TILE_N - 1) // TILE_N
+    # A tile must never straddle a group boundary -- every column in it shares one A tile in
+    # LDS, and different groups need different input channels. So the N grid is
+    # over-provisioned per group and the per-group tail is masked.
+    tiles_per_group = (KG + TILE_N - 1) // TILE_N
+    n_tail = KG % TILE_N != 0
+    grid_n = groups * tiles_per_group
 
     splitk = max(1, min(splitk, k_tiles))
     tiles_per_split = k_tiles // splitk
@@ -267,17 +298,28 @@ def compile_conv3d_implicit(
         tid = fx.thread_idx.x
         if const_expr(WGM > 1):
             pid = fx.Index(fx.block_idx.x) + fx.Index(fx.block_idx.y) * fx.Index(grid_m)
-            blocks_per_group = fx.Index(WGM * grid_n)
-            group_id = pid // blocks_per_group
-            first_m = group_id * fx.Index(WGM)
-            group_rows = fx.Index(grid_m) - first_m
-            group_rows = fx.Index(arith.select(group_rows < fx.Index(WGM), group_rows, fx.Index(WGM)))
-            local = pid % blocks_per_group
-            m_offset = fx.Index(first_m + (local % group_rows)) * TILE_M
-            n_offset = fx.Index(local // group_rows) * TILE_N
+            blocks_per_swizzle = fx.Index(WGM * grid_n)
+            swizzle_id = pid // blocks_per_swizzle
+            first_m = swizzle_id * fx.Index(WGM)
+            swizzle_rows = fx.Index(grid_m) - first_m
+            swizzle_rows = fx.Index(arith.select(swizzle_rows < fx.Index(WGM), swizzle_rows, fx.Index(WGM)))
+            local = pid % blocks_per_swizzle
+            m_offset = fx.Index(first_m + (local % swizzle_rows)) * TILE_M
+            n_tile = fx.Index(local // swizzle_rows)
         else:
             m_offset = fx.block_idx.x * TILE_M
-            n_offset = fx.block_idx.y * TILE_N
+            n_tile = fx.block_idx.y
+        # n_offset is the GLOBAL output-channel base (drives the B row and the store),
+        # n_local is the base within this group (drives every tail check), and ch_base is
+        # this group's first input channel. All three are block-uniform.
+        if const_expr(groups > 1):
+            gi = n_tile // tiles_per_group
+            n_local = (n_tile % tiles_per_group) * TILE_N
+            n_offset = gi * KG + n_local
+            ch_base = gi * CGP
+        else:
+            n_offset = n_tile * TILE_N
+            n_local = n_offset
         if const_expr(use_splitk):
             k_off = fx.block_idx.z * (tiles_per_split * TILE_K)
         else:
@@ -365,21 +407,26 @@ def compile_conv3d_implicit(
                 else:
                     _row_dec.append((local_k, row_valid, n_idx, in_t0, in_h0, in_w0))
 
-        SCALAR_K = c % TILE_K == 0
+        SCALAR_K = CGP % TILE_K == 0
 
         # ---- 3D im2col address math ----
+        # The K axis decomposes against CGP (per-group channels) while every g_off below
+        # keeps `c` (padded total channels) as the NDHWC row stride. `cc` is the absolute
+        # input channel: the group base plus the offset within the group.
         def _a_addr(i, kbase_i, cc_base, ckk_base):
             dec = _row_dec[i]
             local_k = dec[0]
             k_abs = kbase_i + fx.Index(local_k)
             if const_expr(SCALAR_K):
-                cc = cc_base + fx.Index(local_k)
+                cc = cc_base + fx.Index(local_k)  # cc_base already carries ch_base
             else:
-                cc = k_abs % c
+                cc = k_abs % CGP
+                if const_expr(groups > 1):
+                    cc = ch_base + cc
             k_valid = k_abs < fx.Index(crs)
             if const_expr(temporal_only_fast):
                 _, row, row_valid, out_t = dec
-                kt_i = ckk_base if const_expr(SCALAR_K) else k_abs // c
+                kt_i = ckk_base if const_expr(SCALAR_K) else k_abs // CGP
                 temporal_delta = kt_i - pt
                 in_t = out_t + temporal_delta
                 valid = row_valid & k_valid & in_range(in_t, d)
@@ -388,7 +435,7 @@ def compile_conv3d_implicit(
                 else:
                     g_off = (row + temporal_delta * hw_o) * c + cc
             else:
-                ckk = ckk_base if const_expr(SCALAR_K) else k_abs // c
+                ckk = ckk_base if const_expr(SCALAR_K) else k_abs // CGP
                 kw_i = ckk % kw
                 ckk2 = ckk // kw
                 kh_i = ckk2 % kh
@@ -423,7 +470,8 @@ def compile_conv3d_implicit(
             local_k = linear % TILE_K
             col = n_offset + fx.Index(local_n)
             g_off = fx.Int32(col * crs + (fx.Index(k_base) + fx.Index(local_k)))
-            col_valid = (col < fx.Index(k)) if const_expr(n_tail) else None
+            # Tail is per group: the N grid is over-provisioned to groups*tiles_per_group.
+            col_valid = ((n_local + fx.Index(local_n)) < fx.Index(KG)) if const_expr(n_tail) else None
             return g_off, col_valid
 
         # ---- global -> LDS DMA copy, masking via OOB routing ----
@@ -453,8 +501,12 @@ def compile_conv3d_implicit(
             kbase_i = fx.Index(k_base)
             cc_base = ckk_base = None
             if const_expr(SCALAR_K):
-                cc_base = kbase_i % c
-                ckk_base = kbase_i // c
+                # Loop-invariant and block-uniform, so folding ch_base in here costs no
+                # per-load instructions on the SCALAR_K path.
+                cc_base = kbase_i % CGP
+                if const_expr(groups > 1):
+                    cc_base = ch_base + cc_base
+                ckk_base = kbase_i // CGP
             stage_tile = fx.Index(stage) * TILE_M * TILE_K
             for i in range_constexpr(LDG_A_COUNT):
                 if const_expr(BIG_IN_NM):
@@ -550,25 +602,29 @@ def compile_conv3d_implicit(
             ptr = buffer_ops.create_llvm_ptr(addr, address_space=1)
             llvm.StoreOp(value.ir_value() if hasattr(value, "ir_value") else value, ptr, alignment=2)
 
-        def _valid_raw(row, col):
+        # col_loc is the column within its group; the tail check is per group because the N
+        # grid is over-provisioned. At groups == 1 it is the same value as col.
+        def _valid_raw(row, col_loc):
             if const_expr(_row_chk and n_tail):
-                return arith.andi(row < fx.Index(npq), col < fx.Index(k))
+                return arith.andi(row < fx.Index(npq), col_loc < fx.Index(KG))
             if const_expr(_row_chk):
                 v = row < fx.Index(npq)
                 return arith.andi(v, v)
-            v = col < fx.Index(k)
+            v = col_loc < fx.Index(KG)
             return arith.andi(v, v)
 
         def store_acc():
             for mi in range_constexpr(MI_M):
                 row_base = m_offset + wave_m * WARP_M + mi * MFMA_M + c_m_vec
                 for ni in range_constexpr(MI_N):
-                    col = n_offset + fx.Index(wave_n * WARP_N + ni * MFMA_N + c_n)
+                    col_off = fx.Index(wave_n * WARP_N + ni * MFMA_N + c_n)
+                    col = n_offset + col_off
+                    col_loc = (n_local + col_off) if const_expr(groups > 1) else col
                     a = Vec(acc[mi * MI_N + ni])
                     if const_expr(has_bias and not use_splitk):
-                        col_i = fx.Int32(col)
+                        col_i = fx.Int32(col)  # bias is indexed by the global out-channel
                         if const_expr(n_tail):
-                            col_i = arith.select(col < fx.Index(k), col_i, fx.Int32(0))
+                            col_i = arith.select(col_loc < fx.Index(KG), col_i, fx.Int32(0))
                         bias_val = fx.Float32(buffer_ops.buffer_load(bias_rsrc, col_i, vec_width=1, dtype=fx.Float32))
 
                     if const_expr(_vec_store):
@@ -584,7 +640,7 @@ def compile_conv3d_implicit(
                             buffer_ops.buffer_store(v4, y_rsrc, off_nk0)
 
                         if const_expr(_need_chk):
-                            if _valid_raw(row0, col):
+                            if _valid_raw(row0, col_loc):
                                 _emit_vec()
                         else:
                             _emit_vec()
@@ -614,7 +670,7 @@ def compile_conv3d_implicit(
                                     buffer_ops.buffer_store(cval, y_rsrc, off_nk)
 
                         if const_expr(_need_chk):
-                            if _valid_raw(row, col):
+                            if _valid_raw(row, col_loc):
                                 _emit()
                         else:
                             _emit()
@@ -630,15 +686,16 @@ def compile_conv3d_implicit(
     return launch
 
 
-def _resolve_splitk(splitk, npq, crs, k, device, tile=DEFAULT_TILE):
+def _resolve_splitk(splitk, npq, crs, k, device, tile=DEFAULT_TILE, groups=1):
     k_tiles = (crs + TILE_K - 1) // TILE_K
     if splitk is None:
         tile_m, tile_n = tile[0], tile[1]
-        base = ((npq + tile_m - 1) // tile_m) * ((k + tile_n - 1) // tile_n)
+        kg = k // groups
+        base = ((npq + tile_m - 1) // tile_m) * groups * ((kg + tile_n - 1) // tile_n)
         if (
             npq < 4096
             or k_tiles < 16
-            or k % tile_n != 0
+            or kg % tile_n != 0
             or npq % tile_m != 0
             or crs % TILE_K != 0
             or npq * k * 4 > 0x7FFFFFFF
@@ -660,16 +717,34 @@ def _resolve_splitk(splitk, npq, crs, k, device, tile=DEFAULT_TILE):
     return sk
 
 
-def _conv3d_impl(x, weight, bias=None, stride=1, padding=0, splitk=None, stream=None, tile=None, autotune=None):
+def _conv3d_impl(
+    x, weight, bias=None, stride=1, padding=0, groups=1, splitk=None, stream=None, tile=None, autotune=None
+):
     n, c, d, h, w = x.shape
     k, wc, kt, kh, kw = weight.shape
-    assert c == wc
+    groups = int(groups)
+    assert groups >= 1, f"groups must be >= 1, got {groups}"
+    assert c % groups == 0, f"in-channels {c} not divisible by groups {groups}"
+    assert k % groups == 0, f"out-channels {k} not divisible by groups {groups}"
+    assert wc == c // groups, f"weight in-channels {wc} != C/groups = {c // groups}"
     assert x.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16
     st, sh, sw = (stride, stride, stride) if isinstance(stride, int) else stride
     pt, ph, pw = (padding, padding, padding) if isinstance(padding, int) else padding
 
     # 1x1x1 fast path: y[n,k,dhw] = sum_c weight[k,c] * x[n,c,dhw] — pure channel GEMM.
-    if kt == 1 and kh == 1 and kw == 1 and st == 1 and sh == 1 and sw == 1 and pt == 0 and ph == 0 and pw == 0:
+    # Grouped 1x1x1 is block-diagonal, so it goes through the kernel instead.
+    if (
+        groups == 1
+        and kt == 1
+        and kh == 1
+        and kw == 1
+        and st == 1
+        and sh == 1
+        and sw == 1
+        and pt == 0
+        and ph == 0
+        and pw == 0
+    ):
         wm = weight.reshape(k, c)
         if n == 1:
             y = torch.matmul(wm, x.reshape(c, d * h * w)).reshape(n, k, d, h, w)
@@ -684,12 +759,16 @@ def _conv3d_impl(x, weight, bias=None, stride=1, padding=0, splitk=None, stream=
     wo = (w + 2 * pw - kw) // sw + 1
     npq = n * do * ho * wo
 
-    # Zero-pad C to the gather's vector width; padded channels see zero weights.
-    cp = _pad_channels(c)
-    if cp != c:
-        x = torch.nn.functional.pad(x, (0, 0, 0, 0, 0, 0, 0, cp - c))
-    c = cp
-    crs = c * kt * kh * kw
+    # Zero-pad C to the gather's vector width; padded channels see zero weights. The pad is
+    # PER GROUP, since the gather vectorizes along channels and must not cross into the next
+    # group. _prep_weight pads the weight's own C the same way, so the two stay aligned.
+    cg = c // groups
+    cgp = _pad_channels(cg)
+    if cgp != cg:
+        x = torch.nn.functional.pad(x.reshape(n, groups, cg, d, h, w), (0, 0, 0, 0, 0, 0, 0, cgp - cg))
+        x = x.reshape(n, groups * cgp, d, h, w)
+    c = groups * cgp
+    crs = cgp * kt * kh * kw
 
     launch_stream = torch.cuda.current_stream() if stream is None else stream
     has_bias = bias is not None
@@ -698,16 +777,16 @@ def _conv3d_impl(x, weight, bias=None, stride=1, padding=0, splitk=None, stream=
     x_ndhwc = _ncdhw_to_ndhwc(x, stream)
     w_packed = _prep_weight(weight, k, kt, kh, kw, wc)
 
-    shape = (n, c, d, h, w, k, kt, kh, kw, st, sh, sw, pt, ph, pw, has_bias)
+    shape = (n, c, d, h, w, k, kt, kh, kw, st, sh, sw, pt, ph, pw, has_bias, groups)
 
     def _run(the_tile, the_wgm=1):
-        sk = _resolve_splitk(splitk, npq, crs, k, x.device, the_tile)
+        sk = _resolve_splitk(splitk, npq, crs, k, x.device, the_tile, groups)
         if sk > 1:
             y = torch.zeros((npq, k), device=x.device, dtype=torch.float32)
         else:
             y = torch.empty((n, k, do, ho, wo), device=x.device, dtype=torch.bfloat16)
         exe = compile_conv3d_implicit(
-            n, c, d, h, w, k, kt, kh, kw, st, sh, sw, pt, ph, pw, has_bias, sk, the_tile, the_wgm
+            n, c, d, h, w, k, kt, kh, kw, st, sh, sw, pt, ph, pw, has_bias, sk, the_tile, the_wgm, groups
         )
         exe(y, x_ndhwc, w_packed, bias_arg, launch_stream)
         return y, sk
@@ -722,7 +801,9 @@ def _conv3d_impl(x, weight, bias=None, stride=1, padding=0, splitk=None, stream=
         best = autotune_conv3d("bf16", shape, "bf16", candidates, x.device, lambda tw: _run(tw[0], tw[1])[0])
         chosen_tile, chosen_wgm = best
     else:
-        chosen_tile = DEFAULT_TILE
+        # A tile never spans groups, so a 128-wide N tile sits mostly empty when K/groups is
+        # small; drop to the narrowest legal candidate. Autotune picks properly when enabled.
+        chosen_tile = (64, 64, 2, 2) if (groups > 1 and k // groups < DEFAULT_TILE[1]) else DEFAULT_TILE
         chosen_wgm = 1
 
     y, sk = _run(chosen_tile, chosen_wgm)
@@ -764,8 +845,17 @@ def conv3d_implicit(x, weight, bias=None, stride=1, padding=0, **kwargs):
     Rank is taken from the filter (weight.dim() - 2): 3 -> 3D (N,C,D,H,W)/(K,C,T,R,S),
     2 -> 2D (N,C,H,W)/(K,C,R,S), 1 -> 1D (N,C,W)/(K,C,S); x and weight must match.
     True 3D calls run the implementation directly; 2D/1D reshape to the degenerate
-    5D case. stride/padding/bias and extra kwargs (splitk, tile, autotune, stream)
-    forward to the chosen path.
+    5D case. stride/padding/bias and extra kwargs (groups, splitk, tile, autotune,
+    stream) forward to the chosen path.
+
+    ``groups`` follows torch semantics: C and K must both be divisible by it and the
+    weight's channel dim is C/groups. Groups map onto the N grid axis, one tile never
+    spanning two groups, so efficiency tracks how well K/groups fills TILE_N. K/groups
+    >= 128 runs at ungrouped speed; below the narrowest tile (TILE_N=64) the N tile
+    under-fills proportionally. Depthwise (groups == C) is correct but slow: C/groups=1
+    also pads to the gather's 8-wide vector, so 7/8 of the K axis is zeros. High
+    cardinality (e.g. ResNeXt 32x4d, K/groups=4) is correct but not competitive with
+    MIOpen -- that is inherent to the single-GEMM mapping, not a bug.
     """
     assert x.dim() == weight.dim(), f"x rank {x.dim()} != weight rank {weight.dim()}"
     spatial_rank = weight.dim() - 2
