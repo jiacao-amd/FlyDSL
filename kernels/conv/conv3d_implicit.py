@@ -4,8 +4,8 @@
 """Double-buffered implicit-GEMM conv3d (BF16).
 
 x: (N, C, D, H, W) bf16 NCDHW, weight: (K, C/groups, T, R, S) bf16 KCTRS.
-Returns (N, K, Do, Ho, Wo) bf16. Supports stride, padding, dilation, bias, groups,
-and split-K.
+Returns (N, K, Do, Ho, Wo) bf16. Supports stride, padding, padding_mode, dilation,
+bias, groups, and split-K.
 """
 
 import functools
@@ -39,6 +39,10 @@ LDG_VEC = 8
 BF16_BYTES = 2
 
 DEFAULT_TILE = (128, 128, 2, 4)
+
+# Same set torch's nn.ConvNd accepts. Only "zeros" is native to the kernel's im2col
+# gather; the rest are materialized into the input before it runs (see _conv3d_impl).
+PADDING_MODES = ("zeros", "reflect", "replicate", "circular")
 
 # Applied around both tracing and flyc.compile so the hinted and the fast-dispatch
 # paths lower identically. Keys are the ones rocm.py reads: waves_per_eu, maxnreg,
@@ -784,6 +788,7 @@ def _conv3d_impl(
     padding=0,
     dilation=1,
     groups=1,
+    padding_mode="zeros",
     splitk=None,
     stream=None,
     tile=None,
@@ -801,6 +806,17 @@ def _conv3d_impl(
     pt, ph, pw = (padding, padding, padding) if isinstance(padding, int) else padding
     dt, dh, dw = (dilation, dilation, dilation) if isinstance(dilation, int) else dilation
     assert min(dt, dh, dw) >= 1, f"dilation must be >= 1, got {(dt, dh, dw)}"
+    assert padding_mode in PADDING_MODES, f"padding_mode must be one of {PADDING_MODES}, got {padding_mode!r}"
+
+    # Only "zeros" is native to the im2col gather, which masks out-of-range taps to zero.
+    # The other modes need a real value at those coordinates, so materialize the border
+    # into the input and run the conv unpadded -- the same lowering torch's nn.ConvNd
+    # uses (F.conv3d itself takes no padding_mode). The pad tuple is reversed and
+    # doubled to match torch's _reversed_padding_repeated_twice.
+    if padding_mode != "zeros" and (pt or ph or pw):
+        x = torch.nn.functional.pad(x, (pw, pw, ph, ph, pt, pt), mode=padding_mode)
+        n, c, d, h, w = x.shape
+        pt = ph = pw = 0
 
     # 1x1x1 fast path: y[n,k,dhw] = sum_c weight[k,c] * x[n,c,dhw] — pure channel GEMM.
     # Grouped 1x1x1 is block-diagonal, so it goes through the kernel instead.
@@ -919,8 +935,17 @@ def conv3d_implicit(x, weight, bias=None, stride=1, padding=0, dilation=1, **kwa
     Rank is taken from the filter (weight.dim() - 2): 3 -> 3D (N,C,D,H,W)/(K,C,T,R,S),
     2 -> 2D (N,C,H,W)/(K,C,R,S), 1 -> 1D (N,C,W)/(K,C,S); x and weight must match.
     True 3D calls run the implementation directly; 2D/1D reshape to the degenerate
-    5D case. stride/padding/dilation/bias and extra kwargs (groups, splitk, tile,
-    autotune, stream) forward to the chosen path.
+    5D case. stride/padding/dilation/bias and extra kwargs (padding_mode, groups,
+    splitk, tile, autotune, stream) forward to the chosen path.
+
+    ``padding_mode`` follows torch's nn.ConvNd and accepts the same four values:
+    ``zeros`` (default), ``reflect``, ``replicate``, ``circular``. Only ``zeros`` is
+    native to the kernel -- the im2col gather masks out-of-range taps, which *is* zero
+    padding and costs nothing. The other three need a real value at those coordinates,
+    so, exactly as torch's module does, the border is materialized into the input with
+    ``F.pad`` and the conv then runs unpadded. That costs one extra full-tensor copy of
+    x on top of the NCDHW->NDHWC transpose the kernel already does, so prefer ``zeros``
+    on the hot path. Non-zero modes are a no-op when padding is 0.
 
     ``dilation`` follows torch semantics: it spaces the filter taps by that factor
     over the input, shrinking the output to

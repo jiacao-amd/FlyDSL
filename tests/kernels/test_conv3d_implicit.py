@@ -82,6 +82,123 @@ def test_conv3d_factorized_filters_vs_torch(kernel_shape, padding):
     assert torch.allclose(y, y_ref, rtol=2e-2, atol=2e-2)
 
 
+_PAD_MODES = ["zeros", "reflect", "replicate", "circular"]
+_CONV_MOD = {1: torch.nn.Conv1d, 2: torch.nn.Conv2d, 3: torch.nn.Conv3d}
+
+
+def _torch_conv_ref(x, weight, bias=None, stride=1, padding=0, dilation=1, groups=1, padding_mode="zeros"):
+    """Reference via torch's own nn.ConvNd, which is what defines padding_mode semantics.
+
+    F.convNd takes no padding_mode, so the module is the only independent reference for
+    the non-zero modes -- rebuilding it from F.pad here would just restate our own
+    lowering instead of checking it.
+    """
+    rank = weight.dim() - 2
+    mod = _CONV_MOD[rank](
+        in_channels=x.shape[1],
+        out_channels=weight.shape[0],
+        kernel_size=tuple(weight.shape[2:]),
+        stride=stride,
+        padding=padding,
+        dilation=dilation,
+        groups=groups,
+        bias=bias is not None,
+        padding_mode=padding_mode,
+        device=x.device,
+        dtype=x.dtype,
+    )
+    with torch.no_grad():
+        mod.weight.copy_(weight)
+        if bias is not None:
+            mod.bias.copy_(bias.to(x.dtype))
+    return mod(x)
+
+
+# padding_mode mirrors torch's nn.ConvNd. Only "zeros" is native to the im2col gather;
+# reflect/replicate/circular materialize the border into the input first, so these check
+# that the pad is applied on the right axes and in the right order (torch's pad tuple is
+# reversed relative to the padding argument, which is easy to get backwards).
+@_skip_non_cdna4
+@pytest.mark.parametrize("padding_mode", _PAD_MODES)
+@pytest.mark.parametrize(
+    "n,c,t,h,w,k,kernel_shape,stride,padding",
+    [
+        (1, 32, 8, 16, 16, 64, (3, 3, 3), 1, 1),
+        (2, 64, 6, 14, 14, 128, (3, 3, 3), 1, 1),
+        (1, 32, 8, 16, 16, 64, (3, 3, 3), 2, 1),  # strided
+        (1, 64, 8, 16, 16, 64, (3, 3, 3), 1, (0, 2, 3)),  # asymmetric, exercises pad order
+        (1, 16, 6, 12, 16, 32, (3, 3, 3), 1, 2),  # CRS % TILE_K != 0
+        (1, 6, 6, 12, 12, 32, (3, 3, 3), 1, 1),  # C padded to the gather width
+    ],
+)
+def test_conv3d_padding_mode_vs_torch(n, c, t, h, w, k, kernel_shape, stride, padding, padding_mode):
+    torch.manual_seed(3800 + c + k + len(padding_mode))
+    x = torch.randn((n, c, t, h, w), device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn((k, c, *kernel_shape), device="cuda", dtype=torch.bfloat16)
+    bias = torch.randn((k,), device="cuda", dtype=torch.float32)
+
+    y = conv3d_implicit(x, weight, bias=bias, stride=stride, padding=padding, padding_mode=padding_mode)
+    y_ref = _torch_conv_ref(x, weight, bias=bias, stride=stride, padding=padding, padding_mode=padding_mode)
+    torch.cuda.synchronize()
+
+    assert y.shape == y_ref.shape
+    assert torch.allclose(y, y_ref, rtol=2e-2, atol=2e-2)
+
+
+# padding_mode composes with dilation and groups: the border is materialized first, then
+# the dilated / grouped gather runs over the enlarged input.
+@_skip_non_cdna4
+@pytest.mark.parametrize("padding_mode", _PAD_MODES)
+@pytest.mark.parametrize(
+    "n,c,t,h,w,k,groups,padding,dilation",
+    [
+        (1, 64, 8, 16, 16, 128, 1, 2, 2),  # dilated
+        (1, 64, 8, 16, 16, 128, 2, 2, 2),  # dilated + grouped
+        (1, 24, 8, 12, 12, 40, 8, 2, 2),  # Cg=3 pad + Kg=5 tail
+        (1, 64, 8, 16, 16, 128, 1, (1, 2, 3), (1, 2, 3)),  # anisotropic
+    ],
+)
+def test_conv3d_padding_mode_dilation_groups_vs_torch(n, c, t, h, w, k, groups, padding, dilation, padding_mode):
+    torch.manual_seed(3900 + c + k + groups + len(padding_mode))
+    x = torch.randn((n, c, t, h, w), device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn((k, c // groups, 3, 3, 3), device="cuda", dtype=torch.bfloat16)
+
+    y = conv3d_implicit(x, weight, padding=padding, dilation=dilation, groups=groups, padding_mode=padding_mode)
+    y_ref = _torch_conv_ref(x, weight, padding=padding, dilation=dilation, groups=groups, padding_mode=padding_mode)
+    torch.cuda.synchronize()
+
+    assert y.shape == y_ref.shape
+    assert torch.allclose(y, y_ref, rtol=2e-2, atol=2e-2)
+
+
+# With padding 0 there is no border to fill, so every mode must collapse to the same
+# result -- including the 1x1x1 path, which returns before the kernel ever runs.
+@_skip_non_cdna4
+@pytest.mark.parametrize("padding_mode", _PAD_MODES)
+@pytest.mark.parametrize("kernel_shape", [(3, 3, 3), (1, 1, 1)])
+def test_conv3d_padding_mode_zero_padding_is_noop(kernel_shape, padding_mode):
+    torch.manual_seed(4100 + sum(kernel_shape))
+    n, c, t, h, w, k = 1, 64, 6, 14, 14, 64
+    x = torch.randn((n, c, t, h, w), device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn((k, c, *kernel_shape), device="cuda", dtype=torch.bfloat16)
+
+    y = conv3d_implicit(x, weight, padding=0, padding_mode=padding_mode)
+    y_ref = F.conv3d(x, weight, padding=0)
+    torch.cuda.synchronize()
+
+    assert y.shape == y_ref.shape
+    assert torch.allclose(y, y_ref, rtol=2e-2, atol=2e-2)
+
+
+@_skip_non_cdna4
+def test_conv3d_invalid_padding_mode():
+    x = torch.randn((1, 16, 4, 8, 8), device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn((32, 16, 3, 3, 3), device="cuda", dtype=torch.bfloat16)
+
+    with pytest.raises(AssertionError, match="padding_mode must be one of"):
+        conv3d_implicit(x, weight, padding=1, padding_mode="mirror")
+
+
 # Dilation stretches the im2col gather without changing the GEMM K axis. These cover the
 # general 3D address path: isotropic and anisotropic dilation, dilation combined with
 # stride/padding/bias, taps that fall out of range on most rows, and the K-tile / N-tile
@@ -348,6 +465,61 @@ def test_conv2d_dilation_vs_torch(kernel_shape, stride, padding, dilation):
 
     y = conv3d_implicit(x, weight, bias=bias, stride=stride, padding=padding, dilation=dilation)
     y_ref = F.conv2d(x, weight, bias=bias.to(torch.bfloat16), stride=stride, padding=padding, dilation=dilation)
+    torch.cuda.synchronize()
+
+    assert y.shape == y_ref.shape
+    assert torch.allclose(y, y_ref, rtol=2e-2, atol=2e-2)
+
+
+# padding_mode reaches _conv3d_impl through the degenerate-5D wrappers' **kwargs, where
+# the pad runs on a depth-1 tensor with pad_t == 0.
+@_skip_non_cdna4
+@pytest.mark.parametrize("padding_mode", _PAD_MODES)
+@pytest.mark.parametrize(
+    "kernel_shape,stride,padding,dilation",
+    [
+        ((3, 3), 1, 1, 1),
+        ((3, 3), 2, 1, 1),  # strided
+        ((3, 3), 1, (1, 2), 1),  # asymmetric
+        ((3, 3), 1, 2, 2),  # dilated
+        ((5, 5), 1, 2, 1),
+    ],
+)
+def test_conv2d_padding_mode_vs_torch(kernel_shape, stride, padding, dilation, padding_mode):
+    torch.manual_seed(5200 + sum(kernel_shape) + len(padding_mode))
+    n, c, h, w, k = 2, 64, 20, 24, 128
+    x = torch.randn((n, c, h, w), device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn((k, c, *kernel_shape), device="cuda", dtype=torch.bfloat16)
+    bias = torch.randn((k,), device="cuda", dtype=torch.float32)
+
+    y = conv3d_implicit(
+        x, weight, bias=bias, stride=stride, padding=padding, dilation=dilation, padding_mode=padding_mode
+    )
+    y_ref = _torch_conv_ref(
+        x, weight, bias=bias, stride=stride, padding=padding, dilation=dilation, padding_mode=padding_mode
+    )
+    torch.cuda.synchronize()
+
+    assert y.shape == y_ref.shape
+    assert torch.allclose(y, y_ref, rtol=2e-2, atol=2e-2)
+
+
+@_skip_non_cdna4
+@pytest.mark.parametrize("padding_mode", _PAD_MODES)
+@pytest.mark.parametrize("s,stride,padding,dilation", [(3, 1, 1, 1), (5, 2, 2, 1), (3, 1, 2, 2)])
+def test_conv1d_padding_mode_vs_torch(s, stride, padding, dilation, padding_mode):
+    torch.manual_seed(6200 + s + len(padding_mode))
+    n, c, w, k = 2, 64, 96, 128
+    x = torch.randn((n, c, w), device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn((k, c, s), device="cuda", dtype=torch.bfloat16)
+    bias = torch.randn((k,), device="cuda", dtype=torch.float32)
+
+    y = conv3d_implicit(
+        x, weight, bias=bias, stride=stride, padding=padding, dilation=dilation, padding_mode=padding_mode
+    )
+    y_ref = _torch_conv_ref(
+        x, weight, bias=bias, stride=stride, padding=padding, dilation=dilation, padding_mode=padding_mode
+    )
     torch.cuda.synchronize()
 
     assert y.shape == y_ref.shape
