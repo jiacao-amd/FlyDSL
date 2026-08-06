@@ -4,7 +4,8 @@
 """Double-buffered implicit-GEMM conv3d (BF16).
 
 x: (N, C, D, H, W) bf16 NCDHW, weight: (K, C/groups, T, R, S) bf16 KCTRS.
-Returns (N, K, Do, Ho, Wo) bf16. Supports stride, padding, bias, groups, and split-K.
+Returns (N, K, Do, Ho, Wo) bf16. Supports stride, padding, dilation, bias, groups,
+and split-K.
 """
 
 import functools
@@ -228,6 +229,9 @@ def compile_conv3d_implicit(
     pt,
     ph,
     pw,
+    dt=1,
+    dh=1,
+    dw=1,
     has_bias=False,
     splitk=1,
     tile=DEFAULT_TILE,
@@ -263,9 +267,10 @@ def compile_conv3d_implicit(
     assert CGP % LDG_VEC == 0, f"c/groups={CGP} must be a multiple of LDG_VEC={LDG_VEC}; use _conv3d_impl to pad"
     assert BLOCK_THREADS <= 1024, f"BLOCK_THREADS={BLOCK_THREADS} exceeds 1024"
 
-    do = (d + 2 * pt - kt) // st + 1
-    ho = (h + 2 * ph - kh) // sh + 1
-    wo = (w + 2 * pw - kw) // sw + 1
+    # Dilation only stretches the filter's footprint; the K axis (CRS) is unchanged.
+    do = (d + 2 * pt - (dt * (kt - 1) + 1)) // st + 1
+    ho = (h + 2 * ph - (dh * (kh - 1) + 1)) // sh + 1
+    wo = (w + 2 * pw - (dw * (kw - 1) + 1)) // sw + 1
     dhw = do * ho * wo
     hw_o = ho * wo
     npq = n * dhw
@@ -418,6 +423,11 @@ def compile_conv3d_implicit(
         def in_range(v, hi):
             return (v >= 0) & (v < fx.Index(hi))
 
+        def dil(tap, factor):
+            # Filter tap -> input offset. Kept off the multiply when undilated.
+            scaled = tap * factor if const_expr(factor != 1) else tap
+            return scaled
+
         # ---- Per-thread row decomposition (loop-invariant across K) ----
         _row_dec = []  # per-i tuple of precomputed row terms
         for i in range_constexpr(LDG_A_COUNT):
@@ -467,7 +477,7 @@ def compile_conv3d_implicit(
             if const_expr(temporal_only_fast):
                 _, row, row_valid, out_t = dec
                 kt_i = ckk_base if const_expr(SCALAR_K) else k_abs // CGP
-                temporal_delta = kt_i - pt
+                temporal_delta = dil(kt_i, dt) - pt
                 in_t = out_t + temporal_delta
                 valid = row_valid & k_valid & in_range(in_t, d)
                 if const_expr(BIG_IN_N1):
@@ -482,24 +492,24 @@ def compile_conv3d_implicit(
                 kt_i = ckk2 // kh
                 if const_expr(BIG_IN_N1):
                     _, row_valid, di, in_t0, in_h0, in_w0 = dec
-                    in_t = in_t0 + kt_i
-                    in_h = in_h0 + kh_i
-                    in_w = in_w0 + kw_i
+                    in_t = in_t0 + dil(kt_i, dt)
+                    in_h = in_h0 + dil(kh_i, dh)
+                    in_w = in_w0 + dil(kw_i, dw)
                     valid = row_valid & k_valid & in_range(in_t, d) & in_range(in_h, h) & in_range(in_w, w)
                     g_off = (((di * d + (in_t - base_t)) * h + in_h) * w + in_w) * c + cc
                 elif const_expr(BIG_IN_NM):
                     _, row_valid, n_idx, in_t0, in_h0, in_w0 = dec
-                    in_t = in_t0 + kt_i
-                    in_h = in_h0 + kh_i
-                    in_w = in_w0 + kw_i
+                    in_t = in_t0 + dil(kt_i, dt)
+                    in_h = in_h0 + dil(kh_i, dh)
+                    in_w = in_w0 + dil(kw_i, dw)
                     valid = row_valid & k_valid & in_range(in_t, d) & in_range(in_h, h) & in_range(in_w, w)
                     g_off = ((in_t * h + in_h) * w + in_w) * c + cc
                     return fx.Int32(g_off), valid, n_idx
                 else:
                     _, row_valid, n_idx, in_t0, in_h0, in_w0 = dec
-                    in_t = in_t0 + kt_i
-                    in_h = in_h0 + kh_i
-                    in_w = in_w0 + kw_i
+                    in_t = in_t0 + dil(kt_i, dt)
+                    in_h = in_h0 + dil(kh_i, dh)
+                    in_w = in_w0 + dil(kw_i, dw)
                     valid = row_valid & k_valid & in_range(in_t, d) & in_range(in_h, h) & in_range(in_w, w)
                     g_off = (((n_idx * d + in_t) * h + in_h) * w + in_w) * c + cc
             return fx.Int32(g_off), valid
@@ -767,7 +777,17 @@ def _resolve_splitk(splitk, npq, crs, k, device, tile=DEFAULT_TILE, groups=1):
 
 
 def _conv3d_impl(
-    x, weight, bias=None, stride=1, padding=0, groups=1, splitk=None, stream=None, tile=None, autotune=None
+    x,
+    weight,
+    bias=None,
+    stride=1,
+    padding=0,
+    dilation=1,
+    groups=1,
+    splitk=None,
+    stream=None,
+    tile=None,
+    autotune=None,
 ):
     n, c, d, h, w = x.shape
     k, wc, kt, kh, kw = weight.shape
@@ -779,6 +799,8 @@ def _conv3d_impl(
     assert x.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16
     st, sh, sw = (stride, stride, stride) if isinstance(stride, int) else stride
     pt, ph, pw = (padding, padding, padding) if isinstance(padding, int) else padding
+    dt, dh, dw = (dilation, dilation, dilation) if isinstance(dilation, int) else dilation
+    assert min(dt, dh, dw) >= 1, f"dilation must be >= 1, got {(dt, dh, dw)}"
 
     # 1x1x1 fast path: y[n,k,dhw] = sum_c weight[k,c] * x[n,c,dhw] — pure channel GEMM.
     # Grouped 1x1x1 is block-diagonal, so it goes through the kernel instead.
@@ -803,9 +825,10 @@ def _conv3d_impl(
             y = y + bias.to(y.dtype).view(1, k, 1, 1, 1)
         return y
 
-    do = (d + 2 * pt - kt) // st + 1
-    ho = (h + 2 * ph - kh) // sh + 1
-    wo = (w + 2 * pw - kw) // sw + 1
+    do = (d + 2 * pt - (dt * (kt - 1) + 1)) // st + 1
+    ho = (h + 2 * ph - (dh * (kh - 1) + 1)) // sh + 1
+    wo = (w + 2 * pw - (dw * (kw - 1) + 1)) // sw + 1
+    assert min(do, ho, wo) >= 1, f"dilated filter is larger than the padded input: output ({do}, {ho}, {wo})"
     npq = n * do * ho * wo
 
     # Zero-pad C to the gather's vector width; padded channels see zero weights. The pad is
@@ -826,7 +849,7 @@ def _conv3d_impl(
     x_ndhwc = _ncdhw_to_ndhwc(x, stream)
     w_packed = _prep_weight(weight, k, kt, kh, kw, wc)
 
-    shape = (n, c, d, h, w, k, kt, kh, kw, st, sh, sw, pt, ph, pw, has_bias, groups)
+    shape = (n, c, d, h, w, k, kt, kh, kw, st, sh, sw, pt, ph, pw, dt, dh, dw, has_bias, groups)
 
     def _run(the_tile, the_wgm=1):
         sk = _resolve_splitk(splitk, npq, crs, k, x.device, the_tile, groups)
@@ -835,7 +858,7 @@ def _conv3d_impl(
         else:
             y = torch.empty((n, k, do, ho, wo), device=x.device, dtype=torch.bfloat16)
         exe = compile_conv3d_implicit(
-            n, c, d, h, w, k, kt, kh, kw, st, sh, sw, pt, ph, pw, has_bias, sk, the_tile, the_wgm, groups
+            n, c, d, h, w, k, kt, kh, kw, st, sh, sw, pt, ph, pw, dt, dh, dw, has_bias, sk, the_tile, the_wgm, groups
         )
         _dispatch(exe, y, x_ndhwc, w_packed, bias_arg, stream=launch_stream)
         return y, sk
@@ -864,38 +887,47 @@ def _conv3d_impl(
     return y
 
 
-def _conv2d_impl(x, weight, bias=None, stride=1, padding=0, **kwargs):
+def _conv2d_impl(x, weight, bias=None, stride=1, padding=0, dilation=1, **kwargs):
     assert x.dim() == 4 and weight.dim() == 4, "conv2d expects (N,C,H,W) / (K,C,R,S)"
     sh, sw = (stride, stride) if isinstance(stride, int) else stride
     ph, pw = (padding, padding) if isinstance(padding, int) else padding
+    dh, dw = (dilation, dilation) if isinstance(dilation, int) else dilation
     n, c, h, w = x.shape
     k, wc, r, s = weight.shape
     x5 = x.reshape(n, c, 1, h, w)
     w5 = weight.reshape(k, wc, 1, r, s)
-    y5 = _conv3d_impl(x5, w5, bias=bias, stride=(1, sh, sw), padding=(0, ph, pw), **kwargs)
+    y5 = _conv3d_impl(x5, w5, bias=bias, stride=(1, sh, sw), padding=(0, ph, pw), dilation=(1, dh, dw), **kwargs)
     return y5.reshape(y5.shape[0], y5.shape[1], y5.shape[3], y5.shape[4])
 
 
-def _conv1d_impl(x, weight, bias=None, stride=1, padding=0, **kwargs):
+def _conv1d_impl(x, weight, bias=None, stride=1, padding=0, dilation=1, **kwargs):
     assert x.dim() == 3 and weight.dim() == 3, "conv1d expects (N,C,W) / (K,C,S)"
     sw = stride if isinstance(stride, int) else stride[0]
     pw = padding if isinstance(padding, int) else padding[0]
+    dw = dilation if isinstance(dilation, int) else dilation[0]
     n, c, w = x.shape
     k, wc, s = weight.shape
     x5 = x.reshape(n, c, 1, 1, w)
     w5 = weight.reshape(k, wc, 1, 1, s)
-    y5 = _conv3d_impl(x5, w5, bias=bias, stride=(1, 1, sw), padding=(0, 0, pw), **kwargs)
+    y5 = _conv3d_impl(x5, w5, bias=bias, stride=(1, 1, sw), padding=(0, 0, pw), dilation=(1, 1, dw), **kwargs)
     return y5.reshape(y5.shape[0], y5.shape[1], y5.shape[4])
 
 
-def conv3d_implicit(x, weight, bias=None, stride=1, padding=0, **kwargs):
+def conv3d_implicit(x, weight, bias=None, stride=1, padding=0, dilation=1, **kwargs):
     """Main implicit-GEMM conv entry; dispatches 1D/2D/3D by filter rank.
 
     Rank is taken from the filter (weight.dim() - 2): 3 -> 3D (N,C,D,H,W)/(K,C,T,R,S),
     2 -> 2D (N,C,H,W)/(K,C,R,S), 1 -> 1D (N,C,W)/(K,C,S); x and weight must match.
     True 3D calls run the implementation directly; 2D/1D reshape to the degenerate
-    5D case. stride/padding/bias and extra kwargs (groups, splitk, tile, autotune,
-    stream) forward to the chosen path.
+    5D case. stride/padding/dilation/bias and extra kwargs (groups, splitk, tile,
+    autotune, stream) forward to the chosen path.
+
+    ``dilation`` follows torch semantics: it spaces the filter taps by that factor
+    over the input, shrinking the output to
+    ``(D + 2*pad - dilation*(T-1) - 1)//stride + 1`` per axis. It costs nothing in the
+    GEMM -- the K axis is still C/groups*T*R*S -- it only stretches the im2col gather,
+    so a dilated filter reads a wider input footprint per output row and gets less
+    reuse out of cache than the same filter undilated.
 
     ``groups`` follows torch semantics: C and K must both be divisible by it and the
     weight's channel dim is C/groups. Groups map onto the N grid axis, one tile never
@@ -910,9 +942,9 @@ def conv3d_implicit(x, weight, bias=None, stride=1, padding=0, **kwargs):
     assert x.dim() == weight.dim(), f"x rank {x.dim()} != weight rank {weight.dim()}"
     spatial_rank = weight.dim() - 2
     if spatial_rank == 3:
-        return _conv3d_impl(x, weight, bias=bias, stride=stride, padding=padding, **kwargs)
+        return _conv3d_impl(x, weight, bias=bias, stride=stride, padding=padding, dilation=dilation, **kwargs)
     if spatial_rank == 2:
-        return _conv2d_impl(x, weight, bias=bias, stride=stride, padding=padding, **kwargs)
+        return _conv2d_impl(x, weight, bias=bias, stride=stride, padding=padding, dilation=dilation, **kwargs)
     if spatial_rank == 1:
-        return _conv1d_impl(x, weight, bias=bias, stride=stride, padding=padding, **kwargs)
+        return _conv1d_impl(x, weight, bias=bias, stride=stride, padding=padding, dilation=dilation, **kwargs)
     raise ValueError(f"conv3d_implicit supports 1D/2D/3D; got filter rank {weight.dim()}")

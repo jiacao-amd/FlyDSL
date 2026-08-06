@@ -6,8 +6,8 @@
 """Correctness test for the bf16 implicit-GEMM conv3d kernel.
 
 Compares ``conv3d_implicit`` against ``torch.nn.functional.conv3d`` on
-NCDHW/OIDHW bf16 inputs across stride/padding and M%TILE_M / K%TILE_N tail paths.
-Any channel count, spatial extent, and group count is supported.
+NCDHW/OIDHW bf16 inputs across stride/padding/dilation and M%TILE_M / K%TILE_N
+tail paths. Any channel count, spatial extent, and group count is supported.
 """
 
 import pytest
@@ -76,6 +76,143 @@ def test_conv3d_factorized_filters_vs_torch(kernel_shape, padding):
 
     y = conv3d_implicit(x, weight, stride=1, padding=padding)
     y_ref = F.conv3d(x, weight, stride=1, padding=padding)
+    torch.cuda.synchronize()
+
+    assert y.shape == y_ref.shape
+    assert torch.allclose(y, y_ref, rtol=2e-2, atol=2e-2)
+
+
+# Dilation stretches the im2col gather without changing the GEMM K axis. These cover the
+# general 3D address path: isotropic and anisotropic dilation, dilation combined with
+# stride/padding/bias, taps that fall out of range on most rows, and the K-tile / N-tile
+# tails. Filters are chosen so the padded input still admits a >= 1 output extent.
+@_skip_non_cdna4
+@pytest.mark.parametrize(
+    "n,c,t,h,w,k,kernel_shape,stride,padding,dilation",
+    [
+        (1, 32, 8, 16, 16, 64, (3, 3, 3), 1, 2, 2),  # output extent preserved
+        (1, 32, 8, 16, 16, 64, (3, 3, 3), 1, 0, 2),  # unpadded -> output shrinks
+        (2, 64, 6, 18, 18, 128, (3, 3, 3), 1, (1, 2, 3), (1, 2, 3)),  # anisotropic
+        (1, 32, 10, 20, 20, 64, (3, 3, 3), 2, 2, 2),  # strided and dilated
+        (1, 16, 6, 16, 20, 16, (3, 3, 3), 1, 2, 2),  # CRS % TILE_K != 0, K < TILE_N
+        (1, 3, 5, 12, 12, 32, (3, 3, 3), 1, 2, 2),  # C padded to the gather width
+        (1, 64, 5, 9, 9, 64, (3, 3, 3), 1, 4, 4),  # wide taps: most reads masked off
+        (1, 32, 6, 14, 14, 96, (2, 2, 2), 1, 1, 2),  # even filter
+        (1, 64, 4, 10, 10, 64, (1, 1, 1), 1, 0, 3),  # 1x1x1: dilation is a no-op
+    ],
+)
+def test_conv3d_dilation_vs_torch(n, c, t, h, w, k, kernel_shape, stride, padding, dilation):
+    torch.manual_seed(3300 + c + k + sum(kernel_shape))
+    x = torch.randn((n, c, t, h, w), device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn((k, c, *kernel_shape), device="cuda", dtype=torch.bfloat16)
+    bias = torch.randn((k,), device="cuda", dtype=torch.float32)
+
+    y = conv3d_implicit(x, weight, bias=bias, stride=stride, padding=padding, dilation=dilation)
+    y_ref = F.conv3d(x, weight, bias=bias.to(torch.bfloat16), stride=stride, padding=padding, dilation=dilation)
+    torch.cuda.synchronize()
+
+    assert y.shape == y_ref.shape
+    assert torch.allclose(y, y_ref, rtol=2e-2, atol=2e-2)
+
+
+# Split-K reduces through an fp32 (npq, k) staging buffer and only reshapes to
+# (N, K, Do, Ho, Wo) at the end, so the dilated output extents have to reach that path.
+@_skip_non_cdna4
+@pytest.mark.parametrize("dilation", [1, 2])
+def test_conv3d_dilation_splitk_vs_torch(dilation):
+    torch.manual_seed(3500 + dilation)
+    n, c, t, h, w, k = 1, 64, 8, 16, 16, 64
+    x = torch.randn((n, c, t, h, w), device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn((k, c, 3, 3, 3), device="cuda", dtype=torch.bfloat16)
+    bias = torch.randn((k,), device="cuda", dtype=torch.float32)
+
+    y = conv3d_implicit(x, weight, bias=bias, padding=dilation, dilation=dilation, splitk=2)
+    y_ref = F.conv3d(x, weight, bias=bias.to(torch.bfloat16), padding=dilation, dilation=dilation)
+    torch.cuda.synchronize()
+
+    assert y.shape == y_ref.shape
+    assert torch.allclose(y, y_ref, rtol=2e-2, atol=2e-2)
+
+
+# Dilation and groups are independent axes of the address math -- dilation stretches the
+# tap offsets, groups shift the channel base -- so they have to be exercised together,
+# including the per-group channel pad (C/groups % 8 != 0) and per-group N tail.
+@_skip_non_cdna4
+@pytest.mark.parametrize(
+    "n,c,t,h,w,k,groups,padding,dilation",
+    [
+        (1, 64, 6, 16, 16, 128, 2, 2, 2),  # CG=32, KG=64, both aligned
+        (2, 128, 6, 14, 14, 256, 4, 2, 2),  # CG=32, KG=64
+        (1, 256, 6, 12, 12, 128, 8, 2, 2),  # KG=16 -> N tile under-fills
+        (1, 12, 6, 12, 12, 32, 4, 2, 2),  # CG=3 -> per-group pad to 8
+        (1, 24, 6, 10, 10, 40, 8, 2, 2),  # CG=3, KG=5 -> pad + tail together
+        (1, 64, 6, 16, 16, 128, 2, (1, 2, 3), (1, 2, 3)),  # anisotropic
+        (1, 16, 6, 10, 10, 16, 16, 2, 2),  # depthwise: CG=1, KG=1
+    ],
+)
+def test_conv3d_grouped_dilation_vs_torch(n, c, t, h, w, k, groups, padding, dilation):
+    torch.manual_seed(3600 + c + k + groups)
+    x = torch.randn((n, c, t, h, w), device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn((k, c // groups, 3, 3, 3), device="cuda", dtype=torch.bfloat16)
+
+    y = conv3d_implicit(x, weight, padding=padding, dilation=dilation, groups=groups)
+    y_ref = F.conv3d(x, weight, padding=padding, dilation=dilation, groups=groups)
+    torch.cuda.synchronize()
+
+    assert y.shape == y_ref.shape
+    assert torch.allclose(y, y_ref, rtol=2e-2, atol=2e-2)
+
+
+# Dilation must survive the forced-tile path as well as the default heuristic.
+@_skip_non_cdna4
+@pytest.mark.parametrize("tile", [(128, 128, 2, 4), (256, 128, 2, 4), (64, 64, 2, 2)])
+def test_conv3d_dilation_tile_configs(tile):
+    torch.manual_seed(3700 + sum(tile))
+    n, c, t, h, w, k = 2, 64, 6, 18, 18, 192
+    x = torch.randn((n, c, t, h, w), device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn((k, c, 3, 3, 3), device="cuda", dtype=torch.bfloat16)
+
+    y = conv3d_implicit(x, weight, padding=2, dilation=2, tile=tile)
+    y_ref = F.conv3d(x, weight, padding=2, dilation=2)
+    torch.cuda.synchronize()
+
+    assert y.shape == y_ref.shape
+    assert torch.allclose(y, y_ref, rtol=2e-2, atol=2e-2)
+
+
+# Rejected up front rather than silently computing a wrong / empty result.
+@_skip_non_cdna4
+def test_conv3d_invalid_dilation():
+    x = torch.randn((1, 16, 4, 8, 8), device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn((32, 16, 3, 3, 3), device="cuda", dtype=torch.bfloat16)
+
+    with pytest.raises(AssertionError, match="dilation must be >= 1"):
+        conv3d_implicit(x, weight, padding=1, dilation=0)
+    # 5*(3-1)+1 = 11 taps span more than the unpadded extent of 8.
+    with pytest.raises(AssertionError, match="dilated filter is larger than the padded input"):
+        conv3d_implicit(x, weight, padding=0, dilation=5)
+
+
+# Dilated factorized filters. The (T,1,1) cases keep Do==D so they still take the
+# temporal-only fast path, where dilation folds into the per-tap temporal delta.
+@_skip_non_cdna4
+@pytest.mark.parametrize(
+    "kernel_shape,padding,dilation",
+    [
+        ((3, 1, 1), (2, 0, 0), (2, 1, 1)),  # temporal-only fast path, Do == D
+        ((5, 1, 1), (4, 0, 0), (2, 1, 1)),  # temporal-only fast path, wider filter
+        ((3, 1, 1), (0, 0, 0), (2, 1, 1)),  # temporal-only, Do < D -> general path
+        ((1, 3, 3), (0, 2, 2), (1, 2, 2)),  # spatial-only
+    ],
+)
+def test_conv3d_dilated_factorized_filters_vs_torch(kernel_shape, padding, dilation):
+    torch.manual_seed(3400 + sum(kernel_shape) + sum(dilation))
+    n, c, t, h, w, k = 1, 64, 8, 18, 20, 128
+    x = torch.randn((n, c, t, h, w), device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn((k, c, *kernel_shape), device="cuda", dtype=torch.bfloat16)
+
+    y = conv3d_implicit(x, weight, stride=1, padding=padding, dilation=dilation)
+    y_ref = F.conv3d(x, weight, stride=1, padding=padding, dilation=dilation)
     torch.cuda.synchronize()
 
     assert y.shape == y_ref.shape
@@ -188,6 +325,35 @@ def test_conv2d_vs_torch(kernel_shape, stride, padding):
     assert torch.allclose(y, y_ref, rtol=2e-2, atol=2e-2)
 
 
+# 2D dilation. _conv2d_impl widens (dh, dw) to (1, dh, dw) for the degenerate depth axis,
+# so a per-axis dilation tuple must land on the right two axes.
+@_skip_non_cdna4
+@pytest.mark.parametrize(
+    "kernel_shape,stride,padding,dilation",
+    [
+        ((3, 3), 1, 2, 2),
+        ((3, 3), 1, 0, 2),  # unpadded -> output shrinks
+        ((3, 3), 2, 2, 2),  # strided and dilated
+        ((5, 5), 1, 4, 2),
+        ((3, 3), 1, (1, 2), (1, 2)),  # anisotropic
+        ((1, 1), 1, 0, 3),  # 1x1: dilation is a no-op
+    ],
+)
+def test_conv2d_dilation_vs_torch(kernel_shape, stride, padding, dilation):
+    torch.manual_seed(5100 + sum(kernel_shape) + stride)
+    n, c, h, w, k = 2, 64, 24, 28, 128
+    x = torch.randn((n, c, h, w), device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn((k, c, *kernel_shape), device="cuda", dtype=torch.bfloat16)
+    bias = torch.randn((k,), device="cuda", dtype=torch.float32)
+
+    y = conv3d_implicit(x, weight, bias=bias, stride=stride, padding=padding, dilation=dilation)
+    y_ref = F.conv2d(x, weight, bias=bias.to(torch.bfloat16), stride=stride, padding=padding, dilation=dilation)
+    torch.cuda.synchronize()
+
+    assert y.shape == y_ref.shape
+    assert torch.allclose(y, y_ref, rtol=2e-2, atol=2e-2)
+
+
 # Unaligned channel counts and spatial extents.
 @_skip_non_cdna4
 @pytest.mark.parametrize(
@@ -250,6 +416,32 @@ def test_conv1d_vs_torch(s, stride, padding):
 
     y = conv3d_implicit(x, weight, bias=bias, stride=stride, padding=padding)
     y_ref = F.conv1d(x, weight, bias=bias.to(torch.bfloat16), stride=stride, padding=padding)
+    torch.cuda.synchronize()
+
+    assert y.shape == y_ref.shape
+    assert torch.allclose(y, y_ref, rtol=2e-2, atol=2e-2)
+
+
+# 1D dilation. _conv1d_impl takes a scalar or a 1-tuple and widens it to (1, 1, dw).
+@_skip_non_cdna4
+@pytest.mark.parametrize(
+    "s,stride,padding,dilation",
+    [
+        (3, 1, 2, 2),
+        (3, 1, 0, 2),  # unpadded -> output shrinks
+        (5, 2, 4, 2),  # strided and dilated
+        (3, 1, (4,), (4,)),  # tuple form
+    ],
+)
+def test_conv1d_dilation_vs_torch(s, stride, padding, dilation):
+    torch.manual_seed(6100 + s + stride)
+    n, c, w, k = 2, 64, 96, 128
+    x = torch.randn((n, c, w), device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn((k, c, s), device="cuda", dtype=torch.bfloat16)
+    bias = torch.randn((k,), device="cuda", dtype=torch.float32)
+
+    y = conv3d_implicit(x, weight, bias=bias, stride=stride, padding=padding, dilation=dilation)
+    y_ref = F.conv1d(x, weight, bias=bias.to(torch.bfloat16), stride=stride, padding=padding, dilation=dilation)
     torch.cuda.synchronize()
 
     assert y.shape == y_ref.shape
