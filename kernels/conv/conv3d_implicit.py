@@ -40,8 +40,8 @@ BF16_BYTES = 2
 
 DEFAULT_TILE = (128, 128, 2, 4)
 
-# Same set torch's nn.ConvNd accepts. Only "zeros" is native to the kernel's im2col
-# gather; the rest are materialized into the input before it runs (see _conv3d_impl).
+# Same set torch's nn.ConvNd accepts. All four are resolved inside the im2col gather:
+# "zeros" masks an out-of-range tap, the rest remap it onto a real input coordinate.
 PADDING_MODES = ("zeros", "reflect", "replicate", "circular")
 
 # Applied around both tracing and flyc.compile so the hinted and the fast-dispatch
@@ -84,6 +84,16 @@ _WEIGHT_CACHE = {}
 
 def _pad_channels(c):
     return (c + LDG_VEC - 1) // LDG_VEC * LDG_VEC
+
+
+def _big_in(n, c, groups, d, h, w, pt, ph, pw):
+    """Whether the kernel's 64-bit BIG_IN address path would engage for this input.
+
+    Mirrors the kernel's own test, but on the padded channel count and the worst-case
+    (pre-padded) spatial extents, so a "no" here holds for either lowering.
+    """
+    cp = _pad_channels(c // groups) * groups
+    return n * cp * (d + 2 * pt) * (h + 2 * ph) * (w + 2 * pw) > 0x7FFFFFFF
 
 
 def _prep_weight(w, k, kt, kh, kw, c):
@@ -236,6 +246,7 @@ def compile_conv3d_implicit(
     dt=1,
     dh=1,
     dw=1,
+    pad_mode="zeros",
     has_bias=False,
     splitk=1,
     tile=DEFAULT_TILE,
@@ -293,6 +304,10 @@ def compile_conv3d_implicit(
     assert X_BYTES < OOB_SENTINEL_BYTES or BIG_IN, f"input {X_BYTES}B exceeds limit"
     BIG_IN_N1 = BIG_IN and n == 1
     BIG_IN_NM = BIG_IN and n > 1
+    assert pad_mode in PADDING_MODES, f"pad_mode must be one of {PADDING_MODES}, got {pad_mode!r}"
+    # BIG_IN_N1 rebases the buffer to the block's first input row, and a reflected tap can
+    # resolve below that base; _conv3d_impl keeps non-zero modes off the BIG_IN path.
+    assert pad_mode == "zeros" or not BIG_IN, "non-zero pad_mode requires the non-BIG_IN address path"
     X_SAMPLE_BYTES = c * d * h * w * BF16_BYTES
 
     # A tile must never straddle a group boundary -- every column in it shares one A tile in
@@ -432,6 +447,49 @@ def compile_conv3d_implicit(
             scaled = tap * factor if const_expr(factor != 1) else tap
             return scaled
 
+        def pad_coord(v, ext, pad):
+            """Tap coordinate -> in-bounds input coordinate; returns (coord, mask).
+
+            "zeros" leaves the coordinate alone and returns a range mask, which the
+            caller folds into the OOB-sentinel routing so the load reads as zero. Every
+            other mode resolves the coordinate into [0, ext) instead and returns no mask
+            -- the three range checks the zeros path needs disappear, which offsets most
+            of what the remap costs. One step is enough because torch caps reflect at
+            pad < ext and circular at pad <= ext (both asserted host-side), so a
+            coordinate can never wrap past the far edge.
+
+            Index compares here lower to UNSIGNED predicates, so a negative coordinate
+            reads as a huge value and `v < 0` would fold to false. Everything below is
+            therefore expressed on u = v + pad, which is >= 0 by construction (v is
+            ot*stride - pad + tap, so u is ot*stride + tap). Both the tests and every
+            branch value stay non-negative, which makes the unsigned semantics correct
+            rather than merely lucky. The +pad cancels against the -pad already inside
+            v, so it costs nothing once folded.
+            """
+            if const_expr(pad_mode == "zeros"):
+                return v, in_range(v, ext)
+            u = v + fx.Index(pad)
+            low = u < fx.Index(pad)  # v < 0
+            high = u >= fx.Index(pad + ext)  # v >= ext
+            mid = u - fx.Index(pad)  # v, where in range
+            if const_expr(pad_mode == "replicate"):
+                r = arith.select(high, fx.Index(ext - 1), mid)
+                r = arith.select(low, fx.Index(0), r)
+            elif const_expr(pad_mode == "reflect"):
+                # [a b c d e] pad 2 -> [c b a b c d e d c]: -v near, 2*(ext-1) - v far.
+                r = arith.select(high, fx.Index(2 * (ext - 1) + pad) - u, mid)
+                r = arith.select(low, fx.Index(pad) - u, r)
+            else:  # circular: v + ext near, v - ext far
+                r = arith.select(high, u - fx.Index(pad + ext), mid)
+                r = arith.select(low, u + fx.Index(ext - pad), r)
+            return fx.Index(r), None
+
+        def gather_valid(base, *masks):
+            for m in masks:
+                if const_expr(m is not None):
+                    base = base & m
+            return base
+
         # ---- Per-thread row decomposition (loop-invariant across K) ----
         _row_dec = []  # per-i tuple of precomputed row terms
         for i in range_constexpr(LDG_A_COUNT):
@@ -482,12 +540,15 @@ def compile_conv3d_implicit(
                 _, row, row_valid, out_t = dec
                 kt_i = ckk_base if const_expr(SCALAR_K) else k_abs // CGP
                 temporal_delta = dil(kt_i, dt) - pt
-                in_t = out_t + temporal_delta
-                valid = row_valid & k_valid & in_range(in_t, d)
+                in_t, m_t = pad_coord(out_t + temporal_delta, d, pt)
+                valid = gather_valid(row_valid & k_valid, m_t)
+                # `row` already encodes out_t, so the gather shifts it by the resolved
+                # delta; under a remap that is no longer the raw tap offset.
+                delta = temporal_delta if const_expr(pad_mode == "zeros") else (in_t - out_t)
                 if const_expr(BIG_IN_N1):
-                    g_off = ((row + temporal_delta * hw_o) - (fx.Index(nbase) * dhw + base_t * hw_o)) * c + cc
+                    g_off = ((row + delta * hw_o) - (fx.Index(nbase) * dhw + base_t * hw_o)) * c + cc
                 else:
-                    g_off = (row + temporal_delta * hw_o) * c + cc
+                    g_off = (row + delta * hw_o) * c + cc
             else:
                 ckk = ckk_base if const_expr(SCALAR_K) else k_abs // CGP
                 kw_i = ckk % kw
@@ -496,25 +557,25 @@ def compile_conv3d_implicit(
                 kt_i = ckk2 // kh
                 if const_expr(BIG_IN_N1):
                     _, row_valid, di, in_t0, in_h0, in_w0 = dec
-                    in_t = in_t0 + dil(kt_i, dt)
-                    in_h = in_h0 + dil(kh_i, dh)
-                    in_w = in_w0 + dil(kw_i, dw)
-                    valid = row_valid & k_valid & in_range(in_t, d) & in_range(in_h, h) & in_range(in_w, w)
+                    in_t, m_t = pad_coord(in_t0 + dil(kt_i, dt), d, pt)
+                    in_h, m_h = pad_coord(in_h0 + dil(kh_i, dh), h, ph)
+                    in_w, m_w = pad_coord(in_w0 + dil(kw_i, dw), w, pw)
+                    valid = gather_valid(row_valid & k_valid, m_t, m_h, m_w)
                     g_off = (((di * d + (in_t - base_t)) * h + in_h) * w + in_w) * c + cc
                 elif const_expr(BIG_IN_NM):
                     _, row_valid, n_idx, in_t0, in_h0, in_w0 = dec
-                    in_t = in_t0 + dil(kt_i, dt)
-                    in_h = in_h0 + dil(kh_i, dh)
-                    in_w = in_w0 + dil(kw_i, dw)
-                    valid = row_valid & k_valid & in_range(in_t, d) & in_range(in_h, h) & in_range(in_w, w)
+                    in_t, m_t = pad_coord(in_t0 + dil(kt_i, dt), d, pt)
+                    in_h, m_h = pad_coord(in_h0 + dil(kh_i, dh), h, ph)
+                    in_w, m_w = pad_coord(in_w0 + dil(kw_i, dw), w, pw)
+                    valid = gather_valid(row_valid & k_valid, m_t, m_h, m_w)
                     g_off = ((in_t * h + in_h) * w + in_w) * c + cc
                     return fx.Int32(g_off), valid, n_idx
                 else:
                     _, row_valid, n_idx, in_t0, in_h0, in_w0 = dec
-                    in_t = in_t0 + dil(kt_i, dt)
-                    in_h = in_h0 + dil(kh_i, dh)
-                    in_w = in_w0 + dil(kw_i, dw)
-                    valid = row_valid & k_valid & in_range(in_t, d) & in_range(in_h, h) & in_range(in_w, w)
+                    in_t, m_t = pad_coord(in_t0 + dil(kt_i, dt), d, pt)
+                    in_h, m_h = pad_coord(in_h0 + dil(kh_i, dh), h, ph)
+                    in_w, m_w = pad_coord(in_w0 + dil(kw_i, dw), w, pw)
+                    valid = gather_valid(row_valid & k_valid, m_t, m_h, m_w)
                     g_off = (((n_idx * d + in_t) * h + in_h) * w + in_w) * c + cc
             return fx.Int32(g_off), valid
 
@@ -808,15 +869,29 @@ def _conv3d_impl(
     assert min(dt, dh, dw) >= 1, f"dilation must be >= 1, got {(dt, dh, dw)}"
     assert padding_mode in PADDING_MODES, f"padding_mode must be one of {PADDING_MODES}, got {padding_mode!r}"
 
-    # Only "zeros" is native to the im2col gather, which masks out-of-range taps to zero.
-    # The other modes need a real value at those coordinates, so materialize the border
-    # into the input and run the conv unpadded -- the same lowering torch's nn.ConvNd
-    # uses (F.conv3d itself takes no padding_mode). The pad tuple is reversed and
-    # doubled to match torch's _reversed_padding_repeated_twice.
-    if padding_mode != "zeros" and (pt or ph or pw):
+    # The bounds torch enforces inside its own pad. They also make the kernel's remap a
+    # single step, so check them up front on both paths for one consistent message.
+    if padding_mode in ("reflect", "circular"):
+        for ax, (p, ext) in enumerate(zip((pt, ph, pw), (d, h, w))):
+            if padding_mode == "reflect":
+                assert p < ext, f"reflect padding {p} must be < input extent {ext} on spatial axis {ax}"
+            else:
+                assert p <= ext, f"circular padding {p} must be <= input extent {ext} on spatial axis {ax}"
+
+    # Non-zero modes are resolved inside the im2col gather, which remaps an out-of-range
+    # tap onto a real input coordinate instead of masking it to zero. No border is
+    # materialized, so this costs no extra memory traffic.
+    #
+    # BIG_IN is the exception: that path rebases the input buffer per block to keep
+    # offsets in 32 bits, and a reflected tap can resolve below the block's base. Those
+    # inputs (> 2^31 elements) fall back to torch's pre-pad, which is always correct.
+    inline_pad = padding_mode != "zeros" and bool(pt or ph or pw)
+    if inline_pad and _big_in(n, c, groups, d, h, w, pt, ph, pw):
         x = torch.nn.functional.pad(x, (pw, pw, ph, ph, pt, pt), mode=padding_mode)
         n, c, d, h, w = x.shape
         pt = ph = pw = 0
+        inline_pad = False
+    pad_mode = padding_mode if inline_pad else "zeros"
 
     # 1x1x1 fast path: y[n,k,dhw] = sum_c weight[k,c] * x[n,c,dhw] — pure channel GEMM.
     # Grouped 1x1x1 is block-diagonal, so it goes through the kernel instead.
@@ -865,7 +940,7 @@ def _conv3d_impl(
     x_ndhwc = _ncdhw_to_ndhwc(x, stream)
     w_packed = _prep_weight(weight, k, kt, kh, kw, wc)
 
-    shape = (n, c, d, h, w, k, kt, kh, kw, st, sh, sw, pt, ph, pw, dt, dh, dw, has_bias, groups)
+    shape = (n, c, d, h, w, k, kt, kh, kw, st, sh, sw, pt, ph, pw, dt, dh, dw, pad_mode, has_bias, groups)
 
     def _run(the_tile, the_wgm=1):
         sk = _resolve_splitk(splitk, npq, crs, k, x.device, the_tile, groups)
@@ -874,7 +949,30 @@ def _conv3d_impl(
         else:
             y = torch.empty((n, k, do, ho, wo), device=x.device, dtype=torch.bfloat16)
         exe = compile_conv3d_implicit(
-            n, c, d, h, w, k, kt, kh, kw, st, sh, sw, pt, ph, pw, dt, dh, dw, has_bias, sk, the_tile, the_wgm, groups
+            n,
+            c,
+            d,
+            h,
+            w,
+            k,
+            kt,
+            kh,
+            kw,
+            st,
+            sh,
+            sw,
+            pt,
+            ph,
+            pw,
+            dt,
+            dh,
+            dw,
+            pad_mode,
+            has_bias,
+            sk,
+            the_tile,
+            the_wgm,
+            groups,
         )
         _dispatch(exe, y, x_ndhwc, w_packed, bias_arg, stream=launch_stream)
         return y, sk
@@ -939,13 +1037,18 @@ def conv3d_implicit(x, weight, bias=None, stride=1, padding=0, dilation=1, **kwa
     splitk, tile, autotune, stream) forward to the chosen path.
 
     ``padding_mode`` follows torch's nn.ConvNd and accepts the same four values:
-    ``zeros`` (default), ``reflect``, ``replicate``, ``circular``. Only ``zeros`` is
-    native to the kernel -- the im2col gather masks out-of-range taps, which *is* zero
-    padding and costs nothing. The other three need a real value at those coordinates,
-    so, exactly as torch's module does, the border is materialized into the input with
-    ``F.pad`` and the conv then runs unpadded. That costs one extra full-tensor copy of
-    x on top of the NCDHW->NDHWC transpose the kernel already does, so prefer ``zeros``
-    on the hot path. Non-zero modes are a no-op when padding is 0.
+    ``zeros`` (default), ``reflect``, ``replicate``, ``circular``. All four are resolved
+    inside the im2col gather, so none of them materializes a padded copy of the input the
+    way torch's module does: ``zeros`` masks an out-of-range tap to zero, and the other
+    three remap the coordinate onto a real one (clamp / reflect / wrap). The remap
+    replaces the bounds check the mask needs, so a non-zero mode costs roughly the same
+    as ``zeros`` rather than an extra pass over x. As in torch, ``reflect`` requires
+    ``padding < extent`` and ``circular`` ``padding <= extent`` per spatial axis, and a
+    non-zero mode is a no-op when padding is 0.
+
+    The one exception is inputs above 2^31 elements, where the gather rebases the buffer
+    per block to keep offsets 32-bit and a reflected tap can resolve below that base.
+    Those fall back to a ``F.pad`` border, matching torch exactly.
 
     ``dilation`` follows torch semantics: it spaces the filter taps by that factor
     over the input, shrinking the output to

@@ -190,6 +190,84 @@ def test_conv3d_padding_mode_zero_padding_is_noop(kernel_shape, padding_mode):
     assert torch.allclose(y, y_ref, rtol=2e-2, atol=2e-2)
 
 
+# The temporal-only fast path derives the gather offset by shifting the linear row rather
+# than rebuilding it from (t,h,w). A remap breaks the assumption that the shift equals the
+# raw tap offset, so it recomputes the delta from the resolved coordinate -- cover it.
+@_skip_non_cdna4
+@pytest.mark.parametrize("padding_mode", _PAD_MODES)
+@pytest.mark.parametrize(
+    "kernel_shape,padding,dilation",
+    [
+        ((3, 1, 1), (1, 0, 0), (1, 1, 1)),  # Do == D -> temporal fast path
+        ((5, 1, 1), (2, 0, 0), (1, 1, 1)),  # wider filter, still Do == D
+        ((3, 1, 1), (2, 0, 0), (2, 1, 1)),  # dilated, still Do == D
+        ((3, 1, 1), (0, 0, 0), (1, 1, 1)),  # Do < D -> general path, no padding at all
+    ],
+)
+def test_conv3d_padding_mode_temporal_fast_path_vs_torch(kernel_shape, padding, dilation, padding_mode):
+    torch.manual_seed(4400 + sum(kernel_shape) + len(padding_mode))
+    n, c, t, h, w, k = 1, 64, 8, 12, 12, 128
+    x = torch.randn((n, c, t, h, w), device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn((k, c, *kernel_shape), device="cuda", dtype=torch.bfloat16)
+
+    y = conv3d_implicit(x, weight, padding=padding, dilation=dilation, padding_mode=padding_mode)
+    y_ref = _torch_conv_ref(x, weight, padding=padding, dilation=dilation, padding_mode=padding_mode)
+    torch.cuda.synchronize()
+
+    assert y.shape == y_ref.shape
+    assert torch.allclose(y, y_ref, rtol=2e-2, atol=2e-2)
+
+
+# The gather remaps an out-of-range tap in one step, which is only valid inside torch's
+# own bounds (reflect < extent, circular <= extent). Run right at those limits, where a
+# second reflection/wrap would be needed if the reasoning were wrong. Small extents make
+# nearly every tap a remapped one.
+@_skip_non_cdna4
+@pytest.mark.parametrize(
+    "padding_mode,t,h,w,padding",
+    [
+        ("reflect", 5, 9, 9, (4, 8, 8)),  # pad == extent - 1, the strict maximum
+        ("reflect", 4, 5, 6, (3, 4, 5)),
+        ("circular", 5, 9, 9, (5, 9, 9)),  # pad == extent, the maximum
+        ("circular", 4, 5, 6, (4, 5, 6)),
+        ("replicate", 4, 5, 6, (8, 10, 12)),  # replicate has no bound at all
+    ],
+)
+def test_conv3d_padding_mode_at_bounds_vs_torch(padding_mode, t, h, w, padding):
+    torch.manual_seed(4300 + t + h + w)
+    n, c, k = 1, 32, 64
+    x = torch.randn((n, c, t, h, w), device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn((k, c, 3, 3, 3), device="cuda", dtype=torch.bfloat16)
+
+    y = conv3d_implicit(x, weight, padding=padding, padding_mode=padding_mode)
+    y_ref = _torch_conv_ref(x, weight, padding=padding, padding_mode=padding_mode)
+    torch.cuda.synchronize()
+
+    assert y.shape == y_ref.shape
+    assert torch.allclose(y, y_ref, rtol=2e-2, atol=2e-2)
+
+
+# Past those bounds a single-step remap would silently fold twice, so reject up front --
+# torch rejects the same cases from inside its own pad.
+@_skip_non_cdna4
+@pytest.mark.parametrize(
+    "padding_mode,padding,match",
+    [
+        ("reflect", (0, 8, 0), "reflect padding 8 must be < input extent 8"),
+        ("reflect", (0, 0, 9), "reflect padding 9 must be < input extent 8"),
+        ("reflect", (4, 0, 0), "reflect padding 4 must be < input extent 4"),
+        ("circular", (0, 9, 0), "circular padding 9 must be <= input extent 8"),
+        ("circular", (5, 0, 0), "circular padding 5 must be <= input extent 4"),
+    ],
+)
+def test_conv3d_padding_mode_out_of_bounds(padding_mode, padding, match):
+    x = torch.randn((1, 16, 4, 8, 8), device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn((32, 16, 3, 3, 3), device="cuda", dtype=torch.bfloat16)
+
+    with pytest.raises(AssertionError, match=match):
+        conv3d_implicit(x, weight, padding=padding, padding_mode=padding_mode)
+
+
 @_skip_non_cdna4
 def test_conv3d_invalid_padding_mode():
     x = torch.randn((1, 16, 4, 8, 8), device="cuda", dtype=torch.bfloat16)
