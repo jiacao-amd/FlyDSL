@@ -922,6 +922,12 @@ def _conv3d_impl(
     assert min(do, ho, wo) >= 1, f"dilated filter is larger than the padded input: output ({do}, {ho}, {wo})"
     npq = n * do * ho * wo
 
+    # An empty batch would launch the transpose with grid.z == 0 and the conv with grid.x == 0;
+    # both return hipErrorInvalidValue and leave the HIP context unusable. Return the empty
+    # output torch produces instead, before any launch.
+    if n == 0:
+        return torch.empty((0, k, do, ho, wo), device=x.device, dtype=torch.bfloat16)
+
     # Zero-pad C to the gather's vector width; padded channels see zero weights. The pad is
     # PER GROUP, since the gather vectorizes along channels and must not cross into the next
     # group. _prep_weight pads the weight's own C the same way, so the two stay aligned.
@@ -996,8 +1002,14 @@ def _conv3d_impl(
     if sk > 1:
         if has_bias:
             y = y + bias_arg.view(1, k)
-        y = y.to(torch.bfloat16)
-        return y.view(n, do, ho, wo, k).permute(0, 4, 1, 2, 3)
+        # The split-K accumulator is the raw GEMM shape, i.e. NDHWC, so the permute below is
+        # a metadata-only relabel and leaves the data channels-last. Materialize contiguous
+        # NCDHW so the memory format does not depend on whether split-K ran. copy_ folds the
+        # f32 -> bf16 cast into the transpose, keeping this to the single pass the cast cost
+        # anyway.
+        out = torch.empty((n, k, do, ho, wo), device=x.device, dtype=torch.bfloat16)
+        out.copy_(y.view(n, do, ho, wo, k).permute(0, 4, 1, 2, 3))
+        return out
     return y
 
 
@@ -1031,25 +1043,6 @@ def conv3d_implicit(x, weight, bias=None, stride=1, padding=0, dilation=1, **kwa
     """Main implicit-GEMM conv entry; dispatches 1D/2D/3D by filter rank.
 
     Rank is taken from the filter (weight.dim() - 2): 3 -> 3D (N,C,D,H,W)/(K,C,T,R,S),
-    2 -> 2D (N,C,H,W)/(K,C,R,S), 1 -> 1D (N,C,W)/(K,C,S); x and weight must match.
-    True 3D calls run the implementation directly; 2D/1D reshape to the degenerate
-    5D case. stride/padding/dilation/bias and extra kwargs (padding_mode, groups,
-    splitk, tile, autotune, stream) forward to the chosen path.
-
-    ``padding_mode`` follows torch's nn.ConvNd and accepts the same four values:
-    ``zeros`` (default), ``reflect``, ``replicate``, ``circular``. All four are resolved
-    inside the im2col gather, so none of them materializes a padded copy of the input the
-    way torch's module does: ``zeros`` masks an out-of-range tap to zero, and the other
-    three remap the coordinate onto a real one (clamp / reflect / wrap). The remap
-    replaces the bounds check the mask needs, so a non-zero mode costs roughly the same
-    as ``zeros`` rather than an extra pass over x. As in torch, ``reflect`` requires
-    ``padding < extent`` and ``circular`` ``padding <= extent`` per spatial axis, and a
-    non-zero mode is a no-op when padding is 0.
-
-    The one exception is inputs above 2^31 elements, where the gather rebases the buffer
-    per block to keep offsets 32-bit and a reflected tap can resolve below that base.
-    Those fall back to a ``F.pad`` border, matching torch exactly.
-
     ``dilation`` follows torch semantics: it spaces the filter taps by that factor
     over the input, shrinking the output to
     ``(D + 2*pad - dilation*(T-1) - 1)//stride + 1`` per axis. It costs nothing in the
@@ -1067,12 +1060,15 @@ def conv3d_implicit(x, weight, bias=None, stride=1, padding=0, dilation=1, **kwa
     Narrower tiles recover little there -- depthwise wants its own kernel, not this
     single-GEMM mapping.
     """
-    assert x.dim() == weight.dim(), f"x rank {x.dim()} != weight rank {weight.dim()}"
     spatial_rank = weight.dim() - 2
-    if spatial_rank == 3:
-        return _conv3d_impl(x, weight, bias=bias, stride=stride, padding=padding, dilation=dilation, **kwargs)
-    if spatial_rank == 2:
-        return _conv2d_impl(x, weight, bias=bias, stride=stride, padding=padding, dilation=dilation, **kwargs)
-    if spatial_rank == 1:
-        return _conv1d_impl(x, weight, bias=bias, stride=stride, padding=padding, dilation=dilation, **kwargs)
-    raise ValueError(f"conv3d_implicit supports 1D/2D/3D; got filter rank {weight.dim()}")
+    if spatial_rank not in (1, 2, 3):
+        raise ValueError(f"conv3d_implicit supports 1D/2D/3D; got filter rank {weight.dim()}")
+    # An unbatched (C, *spatial) input runs as a batch of one and loses the dim again on
+    # the way out, matching torch.
+    unbatched = x.dim() == weight.dim() - 1
+    if unbatched:
+        x = x.unsqueeze(0)
+    assert x.dim() == weight.dim(), f"x rank {x.dim()} != weight rank {weight.dim()}"
+    impl = {3: _conv3d_impl, 2: _conv2d_impl, 1: _conv1d_impl}[spatial_rank]
+    y = impl(x, weight, bias=bias, stride=stride, padding=padding, dilation=dilation, **kwargs)
+    return y.squeeze(0) if unbatched else y
