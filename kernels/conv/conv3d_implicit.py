@@ -4,8 +4,8 @@
 """Double-buffered implicit-GEMM conv3d (BF16).
 
 x: (N, C, D, H, W) bf16 NCDHW, weight: (K, C/groups, T, R, S) bf16 KCTRS.
-Returns (N, K, Do, Ho, Wo) bf16. Supports stride, padding, padding_mode, dilation,
-bias, groups, and split-K.
+Returns (N, K, Do, Ho, Wo) bf16. Supports stride, padding (int, per-axis tuple, or
+torch's "same" / "valid"), padding_mode, dilation, bias, groups, and split-K.
 """
 
 import functools
@@ -96,15 +96,37 @@ def _big_in(n, c, groups, d, h, w, pt, ph, pw):
     return n * cp * (d + 2 * pt) * (h + 2 * ph) * (w + 2 * pw) > 0x7FFFFFFF
 
 
-def _prep_weight(w, k, kt, kh, kw, c):
-    key = id(w)
+def _evict_weight(key, _ref):
+    """weakref callback: drop the entry the dead weight was pinning."""
     ent = _WEIGHT_CACHE.get(key)
-    if ent is not None and ent[0]() is w:
+    if ent is not None and ent[0]() is None:
+        del _WEIGHT_CACHE[key]
+
+
+def _prep_weight(w, k, kt, kh, kw, c):
+    """Pack (K, C, T, R, S) -> (K, T*R*S*Cpad), memoized on the source weight.
+
+    The memo has to notice an in-place update: an optimizer step or a load_state_dict
+    into existing storage leaves both ``id(w)`` and ``data_ptr()`` unchanged, so a key
+    built from either alone would keep returning the previous step's packed weights.
+    The stamp therefore carries torch's version counter, which is the same signal
+    autograd uses to detect mutation -- this is exactly as sensitive as PyTorch's own
+    checks, no more and no less. (Mutation through ``w.data`` escapes the version
+    counter by design, which is why torch documents it as unsafe; it is invisible here
+    for the same reason it is invisible to autograd.)
+
+    Entries do not outlive their weight: the weakref carries a callback that removes
+    its own key, so neither the dict nor the packed GPU tensors it pins accumulate.
+    """
+    key = w.data_ptr()
+    stamp = (w._version, tuple(w.shape), w.stride(), w.dtype)
+    ent = _WEIGHT_CACHE.get(key)
+    if ent is not None and ent[0]() is w and ent[2] == stamp:
         return ent[1]
     cp = _pad_channels(c)
     wsrc = torch.nn.functional.pad(w, (0, 0, 0, 0, 0, 0, 0, cp - c)) if cp != c else w
     wk = wsrc.permute(0, 2, 3, 4, 1).contiguous().reshape(k, kt * kh * kw * cp)
-    _WEIGHT_CACHE[key] = (weakref.ref(w), wk)
+    _WEIGHT_CACHE[key] = (weakref.ref(w, functools.partial(_evict_weight, key)), wk, stamp)
     return wk
 
 
@@ -115,6 +137,15 @@ _TR_VPL = TR_TILE // TR_VEC
 _TR_ITERS = (TR_TILE * TR_TILE) // (TR_VEC * TR_THREADS)
 _TR_PAD = 8
 _TR_LDS_S = TR_TILE + _TR_PAD
+
+# Largest S = D*H*W the transpose kernel can address on its 64-bit (BIG) path. That path
+# rebases the descriptor per (channel, spatial) tile, but the per-thread read offset
+# `rc * s + sv` still carries the full row stride in 32 bits, with rc up to TR_TILE-1 and
+# sv up to TR_TILE-TR_VEC. Beyond this the product wraps and the gather silently reads
+# the wrong rows, so _ncdhw_to_ndhwc hands those copies to torch instead. Folding the row
+# term into the 64-bit base is not possible here: rc varies per lane and a buffer
+# descriptor has to be wave-uniform.
+TR_MAX_BIG_S = (0x7FFFFFFF - (TR_TILE - TR_VEC)) // (TR_TILE - 1)
 
 
 @functools.lru_cache(maxsize=64)
@@ -218,7 +249,10 @@ def _ncdhw_to_ndhwc(x, stream):
     """Fast NCDHW->NDHWC via the tiled transpose kernel; falls back to torch."""
     n, c, t, h, w = x.shape
     s = t * h * w
+    big = n * c * s > 0x7FFFFFFF
     if not (x.is_contiguous() and x.dtype == torch.bfloat16 and c % TR_VEC == 0):
+        return x.permute(0, 2, 3, 4, 1).contiguous()
+    if big and s > TR_MAX_BIG_S:
         return x.permute(0, 2, 3, 4, 1).contiguous()
     out = torch.empty((n, t, h, w, c), device=x.device, dtype=x.dtype)
     exe = compile_transpose_ncdhw_ndhwc(n, c, s)
@@ -304,6 +338,27 @@ def compile_conv3d_implicit(
     assert X_BYTES < OOB_SENTINEL_BYTES or BIG_IN, f"input {X_BYTES}B exceeds limit"
     BIG_IN_N1 = BIG_IN and n == 1
     BIG_IN_NM = BIG_IN and n > 1
+
+    # BIG_IN_N1 rebases the descriptor to the block's own origin and addresses everything
+    # from there in 32 bits, so the block's reachable footprint has to fit the window.
+    # Rebasing on D alone leaves a whole H*W*C slice in the offset, which is itself past
+    # 2 GiB on a large 2D input, so the origin drops to H as well. Rows run
+    # (n, ot, oh, ow), so oh is monotone within a block and only restarts when the block
+    # crosses an ot boundary -- which cannot happen when the ot windows are a whole number
+    # of tiles. The two bounds below are the worst case over every block: sound in both
+    # cases, and tight in the aligned one.
+    _t_aligned = BIG_IN_N1 and hw_o % TILE_M == 0
+    if BIG_IN_N1:
+        _ot_span = (TILE_M - 1) // hw_o + (1 if _t_aligned else 2)
+        _t_span = min(d - 1, (_ot_span - 1) * st + dt * (kt - 1))
+        _h_span = min(h - 1, ((TILE_M - 1) // wo + 1) * sh + dh * (kh - 1)) if _t_aligned else h - 1
+        _span = (((_t_span * h + _h_span) * w + (w - 1)) * c + c) * BF16_BYTES
+        assert _span <= BIG_IN_NR, (
+            f"input sample too large for the 32-bit gather: a {TILE_M}-row tile reaches "
+            f"{_span / 2**30:.2f} GiB from its rebased origin, past the "
+            f"{BIG_IN_NR / 2**30:.0f} GiB the buffer descriptor addresses. Split the batch "
+            f"over N, or pass a narrower tile=(TILE_M, ...)."
+        )
     assert pad_mode in PADDING_MODES, f"pad_mode must be one of {PADDING_MODES}, got {pad_mode!r}"
     # BIG_IN_N1 rebases the buffer to the block's first input row, and a reflected tap can
     # resolve below that base; _conv3d_impl keeps non-zero modes off the BIG_IN path.
@@ -320,6 +375,12 @@ def compile_conv3d_implicit(
     splitk = max(1, min(splitk, k_tiles))
     tiles_per_split = k_tiles // splitk
     use_splitk = splitk > 1
+    # The bound _resolve_splitk applies, restated where the unsafe arithmetic actually
+    # lives so a caller reaching this builder directly fails loudly instead of silently
+    # wrapping the epilogue's 32-bit atomic offset.
+    assert (
+        not use_splitk or npq * k * 4 <= SPLITK_MAX_STAGING_BYTES
+    ), f"split-K staging {npq * k * 4}B exceeds the {SPLITK_MAX_STAGING_BYTES}B buffer window"
 
     # Software-pipeline depth. 4 stages is optimal across all shapes on gfx950 --
     # even short-K, memory-bound 3x1x1 depends more (not less) on deep prefetch to
@@ -330,7 +391,24 @@ def compile_conv3d_implicit(
     LDS_B_SIZE = PIPE_STAGES * TILE_N * TILE_K
 
     grid_m = (npq + TILE_M - 1) // TILE_M
-    WGM = max(1, int(wgm))
+
+    # HSA's dispatch packet carries grid_size_x as a uint32 *work-item* count, not a block
+    # count, so grid.x * block.x has to stay under 2^32 -- about 2^30 output rows at any
+    # tile size. Past that hipModuleLaunchKernel rejects the launch, and FlyDSL's wrapper
+    # only prints that to stderr, so the kernel would hand back its uninitialised output
+    # as if it had run. The surplus M tiles therefore spill onto grid.z, which is a plain
+    # block count; grid.z already carries split-K, so the two are packed into it together.
+    MAX_GRID_X = 0xFFFFFFFF // BLOCK_THREADS
+    MAX_GRID_YZ = 65535
+    grid_x = min(grid_m, MAX_GRID_X)
+    m_chunks = (grid_m + grid_x - 1) // grid_x
+    assert grid_n <= MAX_GRID_YZ, f"grid.y = {grid_n} exceeds the {MAX_GRID_YZ}-block limit"
+    assert (
+        m_chunks * splitk <= MAX_GRID_YZ
+    ), f"grid.z = {m_chunks} M-chunks x {splitk} splits exceeds the {MAX_GRID_YZ}-block limit"
+    # The block swizzle mixes grid.x and grid.y and has no meaning once M is split across
+    # two axes; it is a locality tweak, so drop it rather than complicate the mapping.
+    WGM = 1 if m_chunks > 1 else max(1, int(wgm))
     elem_ty = fx.BFloat16
     mfma_fn = rocdl.mfma_f32_16x16x32_bf16
     temporal_only_fast = (
@@ -360,7 +438,12 @@ def compile_conv3d_implicit(
         b_lds = lds_alloc.allocate(fx.Array[elem_ty, LDS_B_SIZE, 16]).peek()
 
         tid = fx.thread_idx.x
-        if const_expr(WGM > 1):
+        if const_expr(m_chunks > 1):
+            # grid.z packs (split, m_chunk); the M tiles that did not fit grid.x live here.
+            m_chunk = fx.Index(fx.block_idx.z) % fx.Index(m_chunks)
+            m_offset = (fx.Index(fx.block_idx.x) + m_chunk * fx.Index(grid_x)) * TILE_M
+            n_tile = fx.block_idx.y
+        elif const_expr(WGM > 1):
             pid = fx.Index(fx.block_idx.x) + fx.Index(fx.block_idx.y) * fx.Index(grid_m)
             blocks_per_swizzle = fx.Index(WGM * grid_n)
             swizzle_id = pid // blocks_per_swizzle
@@ -385,16 +468,31 @@ def compile_conv3d_implicit(
             n_offset = n_tile * TILE_N
             n_local = n_offset
         if const_expr(use_splitk):
-            k_off = fx.block_idx.z * (tiles_per_split * TILE_K)
+            if const_expr(m_chunks > 1):
+                split_idx = fx.Index(fx.block_idx.z) // fx.Index(m_chunks)
+            else:
+                split_idx = fx.Index(fx.block_idx.z)
+            k_off = split_idx * (tiles_per_split * TILE_K)
         else:
             k_off = 0
 
         if const_expr(BIG_IN_N1):
             nbase = m_offset // dhw
-            ot_base0 = (m_offset % dhw) // hw_o
-            base_t = ot_base0 - fx.Index(pt)
+            rem0 = m_offset % dhw
+            ot_base0 = rem0 // hw_o
+            # ot*st - pt is the first input row this ot can read; every later row in the
+            # block has ot >= ot_base0, so this is a lower bound for the whole block.
+            base_t = ot_base0 * fx.Index(st) - fx.Index(pt)
             base_t = arith.select(base_t < fx.Index(0), fx.Index(0), base_t)
-            x_base_elem = ((nbase * fx.Index(d) + base_t) * fx.Index(h) + fx.Index(0)) * fx.Index(w) * fx.Index(c)
+            if const_expr(_t_aligned):
+                # An ot window is a whole number of tiles, so oh cannot restart mid-block
+                # and the same argument carries to H.
+                oh_base0 = (rem0 % hw_o) // wo
+                base_h = oh_base0 * fx.Index(sh) - fx.Index(ph)
+                base_h = arith.select(base_h < fx.Index(0), fx.Index(0), base_h)
+            else:
+                base_h = fx.Index(0)
+            x_base_elem = ((nbase * fx.Index(d) + base_t) * fx.Index(h) + base_h) * fx.Index(w) * fx.Index(c)
             x_addr = fx.Int64(buffer_ops.extract_base_index(x)) + fx.Int64(x_base_elem) * fx.Int64(2)
             x_rsrc = buffer_ops.create_buffer_resource_from_addr(x_addr, num_records_bytes=BIG_IN_NR)
         if const_expr(BIG_IN_NM):
@@ -561,7 +659,7 @@ def compile_conv3d_implicit(
                     in_h, m_h = pad_coord(in_h0 + dil(kh_i, dh), h, ph)
                     in_w, m_w = pad_coord(in_w0 + dil(kw_i, dw), w, pw)
                     valid = gather_valid(row_valid & k_valid, m_t, m_h, m_w)
-                    g_off = (((di * d + (in_t - base_t)) * h + in_h) * w + in_w) * c + cc
+                    g_off = (((di * d + (in_t - base_t)) * h + (in_h - base_h)) * w + in_w) * c + cc
                 elif const_expr(BIG_IN_NM):
                     _, row_valid, n_idx, in_t0, in_h0, in_w0 = dec
                     in_t, m_t = pad_coord(in_t0 + dil(kt_i, dt), d, pt)
@@ -705,7 +803,9 @@ def compile_conv3d_implicit(
                 rocdl.sched_vmem(LDG_A_COUNT + LDG_B_COUNT)
             acc = do_compute(acc, a_frags, b_frags)
 
-        _row_chk = npq % TILE_M != 0
+        # grid.x x grid.z over-provisions the M axis whenever the tiles do not divide
+        # evenly between them, so those blocks have to be masked out even at a tail-free npq.
+        _row_chk = (npq % TILE_M != 0) or (grid_x * m_chunks > grid_m)
         _need_chk = _row_chk or n_tail
         _vec_store = (n == 1) and (not use_splitk) and (dhw % MFMA_C_VALUES == 0) and (not BIG_OUT)
 
@@ -795,7 +895,7 @@ def compile_conv3d_implicit(
     @flyc.jit
     def launch(y: fx.Tensor, x: fx.Tensor, weight: fx.Tensor, bias: fx.Tensor, stream: fx.Stream = fx.Stream(None)):
         conv3d_implicit_kernel(y, x, weight, bias).launch(
-            grid=(grid_m, grid_n, splitk), block=(BLOCK_THREADS, 1, 1), stream=stream
+            grid=(grid_x, grid_n, m_chunks * splitk), block=(BLOCK_THREADS, 1, 1), stream=stream
         )
 
     def _launch(y, x, weight, bias, stream=None):
@@ -810,8 +910,23 @@ def compile_conv3d_implicit(
     return _launch
 
 
+# Split-K accumulates into an (npq, k) f32 staging buffer through a buffer atomic, and
+# that atomic's voffset is an unsigned 32-bit BYTE offset while the descriptor's
+# num_records caps the window at 0xFFFFFFFF. Past 4 GB of staging `off_sk * 4` truncates
+# and the high rows wrap onto the start of the buffer, accumulating into unrelated
+# outputs; exactly at 4 GB the last element instead lands outside num_records and its
+# atomic is dropped. Both are silent, so refuse split-K rather than teach the epilogue
+# 64-bit addressing: split-K only pays when the tile grid is too small to fill the device,
+# and an npq*k this large is already tens of thousands of tiles.
+SPLITK_MAX_STAGING_BYTES = 0xFFFFFFFF
+
+
 def _resolve_splitk(splitk, npq, crs, k, device, tile=DEFAULT_TILE, groups=1):
     k_tiles = (crs + TILE_K - 1) // TILE_K
+    # Correctness bound, so it has to gate an explicit splitk too -- the auto branch's own
+    # staging term below is a stricter memory-traffic heuristic, not this limit.
+    if npq * k * 4 > SPLITK_MAX_STAGING_BYTES:
+        return 1
     if splitk is None:
         tile_m, tile_n = tile[0], tile[1]
         kg = k // groups
@@ -841,6 +956,46 @@ def _resolve_splitk(splitk, npq, crs, k, device, tile=DEFAULT_TILE, groups=1):
     return sk
 
 
+def _as_tuple(v, rank, name):
+    """Normalize torch's int / length-1 / length-``rank`` sequence forms to a tuple.
+
+    torch broadcasts a length-1 sequence across every spatial axis, so ``stride=(2,)``
+    on a 3D conv means ``(2, 2, 2)``. Unpacking the sequence directly instead would
+    raise ValueError on that form.
+    """
+    if isinstance(v, int):
+        return (v,) * rank
+    t = tuple(v)
+    if len(t) == 1:
+        return t * rank
+    assert len(t) == rank, f"{name} must be an int or a sequence of 1 or {rank} ints, got {tuple(v)}"
+    return t
+
+
+def _resolve_padding(padding, kernel, stride, dilation):
+    """Normalize torch's ``padding`` argument to a (low, high) pair of per-axis triples.
+
+    An int or a triple is symmetric, so both sides come back the same. The two strings
+    torch accepts are resolved here instead: "valid" is no padding, and "same" holds the
+    output extent equal to the input's, which takes ``dilation * (kernel - 1)`` elements
+    per axis. When that total is odd it cannot be split evenly and torch puts the extra
+    element on the high side, so the two returned triples differ -- see ``_conv3d_impl``
+    for how that case is lowered. "same" is only defined at stride 1, matching torch.
+    """
+    if not isinstance(padding, str):
+        p = _as_tuple(padding, 3, "padding")
+        return p, p
+    if padding == "valid":
+        return (0, 0, 0), (0, 0, 0)
+    if padding != "same":
+        raise ValueError(f"padding string must be 'same' or 'valid', got {padding!r}")
+    assert all(
+        s == 1 for s in stride
+    ), f"padding='same' is not supported for strided convolutions, got stride {tuple(stride)}"
+    total = [dl * (kn - 1) for kn, dl in zip(kernel, dilation)]
+    return tuple(t // 2 for t in total), tuple(t - t // 2 for t in total)
+
+
 def _conv3d_impl(
     x,
     weight,
@@ -857,26 +1012,54 @@ def _conv3d_impl(
 ):
     n, c, d, h, w = x.shape
     k, wc, kt, kh, kw = weight.shape
+    # Device and dtype first: everything below this point either launches a kernel or
+    # allocates on x.device, and a host tensor reaching that far faults the GPU instead
+    # of raising.
+    for name, t in (("x", x), ("weight", weight), ("bias", bias)):
+        assert t is None or t.is_cuda, f"conv3d_implicit needs GPU tensors; {name} is on {t.device}"
+    assert x.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16, (
+        f"conv3d_implicit is a bf16-only kernel; got x={x.dtype}, weight={weight.dtype}"
+    )
+    assert bias is None or (bias.dim() == 1 and bias.numel() == k), (
+        f"bias must be a 1-D tensor of {k} elements, one per output channel; "
+        f"got shape {tuple(bias.shape)}"
+    )
     groups = int(groups)
     assert groups >= 1, f"groups must be >= 1, got {groups}"
     assert c % groups == 0, f"in-channels {c} not divisible by groups {groups}"
     assert k % groups == 0, f"out-channels {k} not divisible by groups {groups}"
     assert wc == c // groups, f"weight in-channels {wc} != C/groups = {c // groups}"
-    assert x.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16
-    st, sh, sw = (stride, stride, stride) if isinstance(stride, int) else stride
-    pt, ph, pw = (padding, padding, padding) if isinstance(padding, int) else padding
-    dt, dh, dw = (dilation, dilation, dilation) if isinstance(dilation, int) else dilation
+    st, sh, sw = _as_tuple(stride, 3, "stride")
+    dt, dh, dw = _as_tuple(dilation, 3, "dilation")
     assert min(dt, dh, dw) >= 1, f"dilation must be >= 1, got {(dt, dh, dw)}"
+    pad_lo, pad_hi = _resolve_padding(padding, (kt, kh, kw), (st, sh, sw), (dt, dh, dw))
+    pt, ph, pw = pad_lo
     assert padding_mode in PADDING_MODES, f"padding_mode must be one of {PADDING_MODES}, got {padding_mode!r}"
 
     # The bounds torch enforces inside its own pad. They also make the kernel's remap a
-    # single step, so check them up front on both paths for one consistent message.
+    # single step, so check them up front on both paths for one consistent message. An
+    # uneven "same" pad is checked on its wider side, which is the one that can overrun.
     if padding_mode in ("reflect", "circular"):
-        for ax, (p, ext) in enumerate(zip((pt, ph, pw), (d, h, w))):
+        for ax, (p, ext) in enumerate(zip(map(max, pad_lo, pad_hi), (d, h, w))):
             if padding_mode == "reflect":
                 assert p < ext, f"reflect padding {p} must be < input extent {ext} on spatial axis {ax}"
             else:
                 assert p <= ext, f"circular padding {p} must be <= input extent {ext} on spatial axis {ax}"
+
+    # An odd "same" total splits unevenly, and the kernel carries one pad per axis. Torch
+    # has the same limitation and resolves it the same way -- by materializing a padded
+    # copy of the input, which it warns about. Under "zeros" only the surplus on the high
+    # side has to exist, because a zero tap past the high edge is already what the
+    # gather's range mask produces; pad that side alone and keep convolving with pad_lo.
+    # The other modes fill the whole border in one call, matching nn.ConvNd, because two
+    # chained pads do not compose (reflecting by 1 then by 2 is not reflecting by 3).
+    if pad_lo != pad_hi:
+        if padding_mode == "zeros":
+            x = torch.nn.functional.pad(x, (0, pad_hi[2] - pw, 0, pad_hi[1] - ph, 0, pad_hi[0] - pt))
+        else:
+            x = torch.nn.functional.pad(x, (pw, pad_hi[2], ph, pad_hi[1], pt, pad_hi[0]), mode=padding_mode)
+            pt = ph = pw = 0
+        n, c, d, h, w = x.shape
 
     # Non-zero modes are resolved inside the im2col gather, which remaps an out-of-range
     # tap onto a real input coordinate instead of masking it to zero. No border is
@@ -1015,34 +1198,53 @@ def _conv3d_impl(
 
 def _conv2d_impl(x, weight, bias=None, stride=1, padding=0, dilation=1, **kwargs):
     assert x.dim() == 4 and weight.dim() == 4, "conv2d expects (N,C,H,W) / (K,C,R,S)"
-    sh, sw = (stride, stride) if isinstance(stride, int) else stride
-    ph, pw = (padding, padding) if isinstance(padding, int) else padding
-    dh, dw = (dilation, dilation) if isinstance(dilation, int) else dilation
+    sh, sw = _as_tuple(stride, 2, "stride")
+    dh, dw = _as_tuple(dilation, 2, "dilation")
+    # A padding string stays a string: the degenerate depth axis is a single 1-tap slice,
+    # so "same" resolves to no padding on it anyway.
+    if isinstance(padding, str):
+        p3 = padding
+    else:
+        ph, pw = _as_tuple(padding, 2, "padding")
+        p3 = (0, ph, pw)
     n, c, h, w = x.shape
     k, wc, r, s = weight.shape
     x5 = x.reshape(n, c, 1, h, w)
     w5 = weight.reshape(k, wc, 1, r, s)
-    y5 = _conv3d_impl(x5, w5, bias=bias, stride=(1, sh, sw), padding=(0, ph, pw), dilation=(1, dh, dw), **kwargs)
+    y5 = _conv3d_impl(x5, w5, bias=bias, stride=(1, sh, sw), padding=p3, dilation=(1, dh, dw), **kwargs)
     return y5.reshape(y5.shape[0], y5.shape[1], y5.shape[3], y5.shape[4])
 
 
 def _conv1d_impl(x, weight, bias=None, stride=1, padding=0, dilation=1, **kwargs):
     assert x.dim() == 3 and weight.dim() == 3, "conv1d expects (N,C,W) / (K,C,S)"
-    sw = stride if isinstance(stride, int) else stride[0]
-    pw = padding if isinstance(padding, int) else padding[0]
-    dw = dilation if isinstance(dilation, int) else dilation[0]
+    (sw,) = _as_tuple(stride, 1, "stride")
+    (dw,) = _as_tuple(dilation, 1, "dilation")
+    if isinstance(padding, str):
+        p3 = padding
+    else:
+        p3 = (0, 0, _as_tuple(padding, 1, "padding")[0])
     n, c, w = x.shape
     k, wc, s = weight.shape
     x5 = x.reshape(n, c, 1, 1, w)
     w5 = weight.reshape(k, wc, 1, 1, s)
-    y5 = _conv3d_impl(x5, w5, bias=bias, stride=(1, 1, sw), padding=(0, 0, pw), dilation=(1, 1, dw), **kwargs)
+    y5 = _conv3d_impl(x5, w5, bias=bias, stride=(1, 1, sw), padding=p3, dilation=(1, 1, dw), **kwargs)
     return y5.reshape(y5.shape[0], y5.shape[1], y5.shape[4])
 
 
 def conv3d_implicit(x, weight, bias=None, stride=1, padding=0, dilation=1, **kwargs):
     """Main implicit-GEMM conv entry; dispatches 1D/2D/3D by filter rank.
 
-    Rank is taken from the filter (weight.dim() - 2): 3 -> 3D (N,C,D,H,W)/(K,C,T,R,S),
+    Rank is taken from the filter (weight.dim() - 2): 3 -> 3D (N,C,D,H,W)/(K,C,T,R,S).
+
+    ``padding`` takes an int, a per-axis tuple, or one of torch's two strings. "valid" is
+    no padding. "same" pads so the output keeps the input's spatial extent, which needs
+    ``dilation * (kernel - 1)`` elements per axis and, like torch, is only defined at
+    stride 1. That total is normally even and costs nothing beyond an ordinary symmetric
+    pad. An even-length filter under odd dilation makes it odd, and torch's rule of
+    putting the extra element on the high side then asks for a pad the kernel cannot
+    express with one value per axis; that case materializes a padded input first, exactly
+    as torch does (it warns about the same copy). ``padding_mode`` applies to "same" too.
+
     ``dilation`` follows torch semantics: it spaces the filter taps by that factor
     over the input, shrinking the output to
     ``(D + 2*pad - dilation*(T-1) - 1)//stride + 1`` per axis. It costs nothing in the

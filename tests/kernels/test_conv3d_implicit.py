@@ -277,6 +277,105 @@ def test_conv3d_invalid_padding_mode():
         conv3d_implicit(x, weight, padding=1, padding_mode="mirror")
 
 
+# torch's string padding. "same" holds the output extent at the input's, which needs
+# dilation*(k-1) elements per axis; odd-length filters split that evenly and go down the
+# ordinary symmetric path, while even-length ones (2, 4, ...) split unevenly and take the
+# materialized-copy path instead. F.convNd is the reference here since it resolves the
+# strings itself.
+@_skip_non_cdna4
+@pytest.mark.parametrize("padding", ["same", "valid"])
+@pytest.mark.parametrize(
+    "n,c,t,h,w,k,kernel_shape,dilation",
+    [
+        (1, 32, 8, 16, 16, 64, (3, 3, 3), 1),
+        (2, 64, 6, 14, 14, 128, (3, 3, 3), 1),
+        (1, 32, 8, 14, 14, 64, (3, 3, 3), 2),  # dilated -> wider "same" pad
+        (1, 32, 8, 14, 14, 64, (5, 3, 1), 1),  # anisotropic filter
+        (1, 32, 8, 14, 14, 64, (3, 5, 3), (1, 2, 3)),  # anisotropic dilation
+        (1, 64, 8, 12, 12, 64, (1, 1, 1), 1),  # no padding either way
+        (1, 32, 8, 12, 12, 64, (2, 2, 2), 1),  # even filter -> uneven "same" pad
+        (1, 32, 8, 12, 12, 64, (4, 3, 2), 1),  # uneven on two of three axes
+        (1, 16, 6, 12, 16, 32, (3, 3, 3), 1),  # CRS % TILE_K != 0
+        (1, 6, 6, 12, 12, 32, (3, 3, 3), 1),  # C padded to the gather width
+    ],
+)
+def test_conv3d_padding_string_vs_torch(n, c, t, h, w, k, kernel_shape, dilation, padding):
+    torch.manual_seed(4600 + c + k + sum(kernel_shape))
+    x = torch.randn((n, c, t, h, w), device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn((k, c, *kernel_shape), device="cuda", dtype=torch.bfloat16)
+    bias = torch.randn((k,), device="cuda", dtype=torch.float32)
+
+    y = conv3d_implicit(x, weight, bias=bias, padding=padding, dilation=dilation)
+    y_ref = F.conv3d(x, weight, bias=bias.to(torch.bfloat16), padding=padding, dilation=dilation)
+    torch.cuda.synchronize()
+
+    if padding == "same":
+        assert y.shape[2:] == x.shape[2:]
+    assert y.shape == y_ref.shape
+    assert torch.allclose(y, y_ref, rtol=2e-2, atol=2e-2)
+
+
+# "same" composes with padding_mode, groups, and dilation. The even filters matter most:
+# there the border is uneven, which the non-zero modes have to fill in a single pad to
+# match nn.ConvNd (two chained pads would reflect/wrap twice).
+@_skip_non_cdna4
+@pytest.mark.parametrize("padding_mode", _PAD_MODES)
+@pytest.mark.parametrize(
+    "kernel_shape,dilation,groups",
+    [
+        ((3, 3, 3), 1, 1),
+        ((3, 3, 3), 2, 1),
+        ((3, 3, 3), 2, 8),  # Cg=3 pad + Kg=5 tail
+        ((2, 2, 2), 1, 1),  # uneven border
+        ((4, 3, 2), 1, 1),  # uneven on two of three axes
+        ((2, 4, 4), 1, 8),
+    ],
+)
+def test_conv3d_padding_same_padding_mode_vs_torch(kernel_shape, dilation, groups, padding_mode):
+    torch.manual_seed(4700 + sum(kernel_shape) + groups + len(padding_mode))
+    n, c, t, h, w, k = 1, 24, 8, 12, 12, 40
+    x = torch.randn((n, c, t, h, w), device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn((k, c // groups, *kernel_shape), device="cuda", dtype=torch.bfloat16)
+
+    y = conv3d_implicit(x, weight, padding="same", dilation=dilation, groups=groups, padding_mode=padding_mode)
+    y_ref = _torch_conv_ref(x, weight, padding="same", dilation=dilation, groups=groups, padding_mode=padding_mode)
+    torch.cuda.synchronize()
+
+    assert y.shape == y_ref.shape
+    assert torch.allclose(y, y_ref, rtol=2e-2, atol=2e-2)
+
+
+# A "same" pad wide enough to overrun the input is rejected on its wider side, which is
+# the one that overruns first. torch rejects the same filters from inside its own pad.
+@_skip_non_cdna4
+@pytest.mark.parametrize(
+    "padding_mode,kt,match",
+    [
+        ("reflect", 10, "reflect padding 5 must be < input extent 5"),
+        ("circular", 12, "circular padding 6 must be <= input extent 5"),
+    ],
+)
+def test_conv3d_padding_same_out_of_bounds(padding_mode, kt, match):
+    x = torch.randn((1, 16, 5, 8, 8), device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn((32, 16, kt, 1, 1), device="cuda", dtype=torch.bfloat16)
+
+    with pytest.raises(AssertionError, match=match):
+        conv3d_implicit(x, weight, padding="same", padding_mode=padding_mode)
+
+
+@_skip_non_cdna4
+def test_conv3d_padding_string_invalid():
+    x = torch.randn((1, 16, 4, 8, 8), device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn((32, 16, 3, 3, 3), device="cuda", dtype=torch.bfloat16)
+
+    # torch defines "same" at stride 1 only; a strided one has no single pad that keeps
+    # the extent.
+    with pytest.raises(AssertionError, match="padding='same' is not supported for strided convolutions"):
+        conv3d_implicit(x, weight, stride=2, padding="same")
+    with pytest.raises(ValueError, match="padding string must be 'same' or 'valid'"):
+        conv3d_implicit(x, weight, padding="SAME")
+
+
 # Dilation stretches the im2col gather without changing the GEMM K axis. These cover the
 # general 3D address path: isotropic and anisotropic dilation, dilation combined with
 # stride/padding/bias, taps that fall out of range on most rows, and the K-tile / N-tile
@@ -327,6 +426,40 @@ def test_conv3d_dilation_splitk_vs_torch(dilation):
 
     assert y.shape == y_ref.shape
     assert torch.allclose(y, y_ref, rtol=2e-2, atol=2e-2)
+
+
+# The split-K epilogue addresses its (npq, k) fp32 staging buffer with an unsigned 32-bit
+# byte offset, so it is only correct below 4 GB of staging: past that the offset truncates
+# and wraps onto the start of the buffer, and exactly at 4 GB the last element falls
+# outside the descriptor's num_records and its atomic is dropped. Both are silent, so the
+# bound has to hold for a caller-supplied splitk and not just the auto-picked one. Pure
+# host-side arithmetic -- the shapes are far too large to actually run.
+@pytest.mark.parametrize("splitk", [None, 2, 4])
+def test_resolve_splitk_staging_limit(splitk):
+    from kernels.conv.conv3d_implicit import SPLITK_MAX_STAGING_BYTES, _resolve_splitk
+
+    k, crs = 64, 512  # crs -> 16 K-tiles, divisible by either splitk
+    over = 2**32 // (k * 4)  # staging of exactly 4 GB, the first unsafe size
+    assert _resolve_splitk(splitk, over, crs, k, None) == 1
+    assert _resolve_splitk(splitk, 4 * over, crs, k, None) == 1
+
+    # One output row lower is addressable, so an explicit request is still honoured --
+    # the auto path still declines, on its own stricter heuristics.
+    under = over - 1
+    assert under * k * 4 <= SPLITK_MAX_STAGING_BYTES
+    assert _resolve_splitk(splitk, under, crs, k, None) == (1 if splitk is None else splitk)
+
+
+# The same bound guards the builder itself, so bypassing _resolve_splitk cannot quietly
+# produce a kernel that wraps its atomics.
+def test_compile_conv3d_splitk_staging_limit():
+    from kernels.conv.conv3d_implicit import compile_conv3d_implicit
+
+    # 1x1x1 filter over 256^3: npq * k * 4 is exactly 4 GB.
+    shape = dict(n=1, c=64, d=256, h=256, w=256, k=64, kt=1, kh=1, kw=1, st=1, sh=1, sw=1, pt=0, ph=0, pw=0)
+    with pytest.raises(AssertionError, match="split-K staging 4294967296B exceeds"):
+        compile_conv3d_implicit(**shape, splitk=2)
+    compile_conv3d_implicit(**shape, splitk=1)  # same shape without split-K is fine
 
 
 # Dilation and groups are independent axes of the address math -- dilation stretches the
@@ -549,6 +682,29 @@ def test_conv2d_dilation_vs_torch(kernel_shape, stride, padding, dilation):
     assert torch.allclose(y, y_ref, rtol=2e-2, atol=2e-2)
 
 
+# A padding string reaches _conv3d_impl unresolved, so the depth axis it adds must come
+# out unpadded -- the degenerate slice is 1 deep with a 1-tap filter, where "same" is 0.
+@_skip_non_cdna4
+@pytest.mark.parametrize("padding", ["same", "valid"])
+@pytest.mark.parametrize("padding_mode", _PAD_MODES)
+@pytest.mark.parametrize("kernel_shape,dilation", [((3, 3), 1), ((5, 3), 2), ((4, 2), 1)])
+def test_conv2d_padding_string_vs_torch(kernel_shape, dilation, padding, padding_mode):
+    torch.manual_seed(5300 + sum(kernel_shape) + len(padding_mode))
+    n, c, h, w, k = 2, 64, 20, 24, 128
+    x = torch.randn((n, c, h, w), device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn((k, c, *kernel_shape), device="cuda", dtype=torch.bfloat16)
+    bias = torch.randn((k,), device="cuda", dtype=torch.float32)
+
+    y = conv3d_implicit(x, weight, bias=bias, padding=padding, dilation=dilation, padding_mode=padding_mode)
+    y_ref = _torch_conv_ref(x, weight, bias=bias, padding=padding, dilation=dilation, padding_mode=padding_mode)
+    torch.cuda.synchronize()
+
+    if padding == "same":
+        assert y.shape[2:] == x.shape[2:]
+    assert y.shape == y_ref.shape
+    assert torch.allclose(y, y_ref, rtol=2e-2, atol=2e-2)
+
+
 # padding_mode reaches _conv3d_impl through the degenerate-5D wrappers' **kwargs, where
 # the pad runs on a depth-1 tensor with pad_t == 0.
 @_skip_non_cdna4
@@ -578,6 +734,26 @@ def test_conv2d_padding_mode_vs_torch(kernel_shape, stride, padding, dilation, p
     )
     torch.cuda.synchronize()
 
+    assert y.shape == y_ref.shape
+    assert torch.allclose(y, y_ref, rtol=2e-2, atol=2e-2)
+
+
+@_skip_non_cdna4
+@pytest.mark.parametrize("padding", ["same", "valid"])
+@pytest.mark.parametrize("padding_mode", _PAD_MODES)
+@pytest.mark.parametrize("s,dilation", [(3, 1), (5, 2), (4, 1)])
+def test_conv1d_padding_string_vs_torch(s, dilation, padding, padding_mode):
+    torch.manual_seed(6300 + s + len(padding_mode))
+    n, c, w, k = 2, 64, 96, 128
+    x = torch.randn((n, c, w), device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn((k, c, s), device="cuda", dtype=torch.bfloat16)
+
+    y = conv3d_implicit(x, weight, padding=padding, dilation=dilation, padding_mode=padding_mode)
+    y_ref = _torch_conv_ref(x, weight, padding=padding, dilation=dilation, padding_mode=padding_mode)
+    torch.cuda.synchronize()
+
+    if padding == "same":
+        assert y.shape[2:] == x.shape[2:]
     assert y.shape == y_ref.shape
     assert torch.allclose(y, y_ref, rtol=2e-2, atol=2e-2)
 
