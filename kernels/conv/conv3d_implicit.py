@@ -984,6 +984,7 @@ def _resolve_padding(padding, kernel, stride, dilation):
     """
     if not isinstance(padding, str):
         p = _as_tuple(padding, 3, "padding")
+        assert min(p) >= 0, f"negative padding is not supported, got (pt, ph, pw) = {p}"
         return p, p
     if padding == "valid":
         return (0, 0, 0), (0, 0, 0)
@@ -1030,6 +1031,13 @@ def _conv3d_impl(
     assert k % groups == 0, f"out-channels {k} not divisible by groups {groups}"
     assert wc == c // groups, f"weight in-channels {wc} != C/groups = {c // groups}"
     st, sh, sw = _as_tuple(stride, 3, "stride")
+    # Both of these are torch errors, and validating them here is what makes them say so:
+    # stride 0 would otherwise divide by zero computing the output extent below, and a
+    # negative stride or padding would collapse that extent and trip the unrelated
+    # "dilated filter is larger than the padded input" assertion. The 1D/2D entries widen
+    # their argument to three axes with 1s, so the triple reported here can be longer than
+    # the one that was passed in.
+    assert min(st, sh, sw) >= 1, f"non-positive stride is not supported, got (st, sh, sw) = {(st, sh, sw)}"
     dt, dh, dw = _as_tuple(dilation, 3, "dilation")
     assert min(dt, dh, dw) >= 1, f"dilation must be >= 1, got {(dt, dh, dw)}"
     pad_lo, pad_hi = _resolve_padding(padding, (kt, kh, kw), (st, sh, sw), (dt, dh, dw))
